@@ -23,7 +23,6 @@ ci:
 default_install_hook_types: [pre-commit, commit-msg]
 default_stages: [pre-commit]
 
-exclude: "^docs/conf.py"
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -163,4 +162,3 @@ repos:
         files: ^\.github/workflows/[^/]+$
         types:
           - yaml
-      - id: check-readthedocs
