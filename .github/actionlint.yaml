@@ -1,0 +1,16 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Path-specific configurations.
+paths:
+  .github/workflows/code-monkey.yaml:
+    ignore:
+      # actionlint validates context properties against hardcoded
+      # lists that predate 'github.job_workflow_sha' and
+      # 'job.workflow_sha'. GitHub documents job_workflow_sha as the
+      # commit of the called reusable workflow file; the select job
+      # uses it to version-lock the asset checkout to the commit the
+      # caller pinned. Remove once actionlint learns the properties.
+      - 'property "job_workflow_sha" is not defined in object type'
+      - 'property "workflow_sha" is not defined in object type'

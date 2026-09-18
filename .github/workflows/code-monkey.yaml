@@ -1,0 +1,880 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Reusable workflow: select open issues, run one Copilot CLI coding
+# agent per repository against a checkout, and publish the result as
+# GitHub-signed commits and a pull request through a trusted job.
+#
+# Trust boundary (docs/DESIGN.md sections 4, 5, 8): the author job
+# holds no repository write credential and never sees the App key.
+# It emits a git bundle and a manifest; the publish job treats both
+# as hostile input, verifies them offline, and makes every write with
+# a per-repository App token.
+name: 'Code Monkey'
+
+# yamllint disable-line rule:truthy
+on:
+  workflow_call:
+    inputs:
+      org:
+        description: 'Target owner; live runs require an organisation App'
+        required: true
+        type: string
+      mode:
+        description: 'select, branches, or pull-requests'
+        type: string
+        default: 'pull-requests'
+      dry_run:
+        description: 'Run the agent; publish nothing'
+        type: boolean
+        default: true
+      model:
+        description: 'Copilot CLI model identifier'
+        type: string
+        default: 'claude-opus-5'
+      max_issues:
+        description: 'Issues to work this run; 0 lifts the cap'
+        type: string
+        default: '10'
+      max_runtime_minutes:
+        description: 'Wall-clock budget for each agent session'
+        type: string
+        default: '180'
+      max_concurrent_agents:
+        description: 'Agents running at once (1-30)'
+        type: string
+        default: '10'
+      allow_subagents:
+        description: 'Let the agent spawn sub-agents'
+        type: boolean
+        default: true
+      include_dotgithub:
+        description: 'Consider issues in the .github repository'
+        type: boolean
+        default: false
+      include_assigned:
+        description: 'Consider issues that have an assignee'
+        type: boolean
+        default: false
+      load_repo_skills:
+        description: 'Let the agent use skills from the target checkout'
+        type: boolean
+        default: false
+      repositories:
+        description: 'Repositories to scan; commas and/or spaces'
+        type: string
+        default: ''
+      exclude_repos:
+        description: 'Comma-separated repos to skip (overrides bundled list)'
+        type: string
+        default: ''
+      guidance_repository:
+        description: 'Repository holding the organisation AGENTS.md'
+        type: string
+        default: ''
+      guidance_ref:
+        description: 'Branch or tag of the guidance to record and use'
+        type: string
+        default: 'main'
+      egress_policy:
+        description: 'harden-runner egress for trusted jobs: audit or block'
+        type: string
+        default: 'audit'
+      egress_allow_config:
+        description: 'harden-runner-block-action config coordinate'
+        type: string
+        default: ''
+      github_app_client_id:
+        description: 'GitHub App client id; empty limits runs to dry-run'
+        type: string
+        default: ''
+      assets_repository:
+        description: 'Trusted repository providing the prompt and scripts'
+        type: string
+        default: 'lfreleng-actions/github-code-monkey'
+      assets_ref:
+        description: >-
+          Commit, tag or branch of the assets; empty resolves the
+          calling workflow's own commit
+        type: string
+        default: ''
+    secrets:
+      copilot_token:
+        description: >-
+          Personal fine-grained PAT with Copilot Requests and no
+          repository grants; the only credential the agent receives
+        required: false
+      github_app_private_key:
+        description: 'GitHub App private key, used in trusted jobs alone'
+        required: false
+
+permissions: {}
+
+# One pipeline per caller and owner. Different caller repositories
+# need external coordination if they target the same estate.
+concurrency:
+  group: "code-monkey-${{ github.repository }}-${{ inputs.org }}"
+  cancel-in-progress: false
+
+env:
+  COPILOT_CLI_VERSION: '1.0.83'
+
+jobs:
+  select:
+    name: 'Select'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 20
+    permissions:
+      issues: read  # Candidate scan without an App (dry-run plumbing)
+      contents: read  # Checkout trusted assets; read public repositories
+    outputs:
+      assets_sha: "${{ steps.pinned.outputs.sha }}"
+      namespace: "${{ steps.identity.outputs.namespace }}"
+      evidence_id: "${{ steps.evidence.outputs.artifact-id }}"
+      selection_sha256: "${{ steps.digests.outputs.selection }}"
+      guidance_sha256: "${{ steps.digests.outputs.guidance }}"
+      count: "${{ steps.chosen.outputs.count }}"
+      matrix: "${{ steps.chosen.outputs.matrix }}"
+      run_agent: "${{ steps.chosen.outputs.run_agent }}"
+      author_timeout: "${{ steps.budget.outputs.author_timeout }}"
+      agent_timeout: "${{ steps.budget.outputs.agent_timeout }}"
+      max_parallel: "${{ steps.budget.outputs.max_parallel }}"
+    steps:
+      - name: 'Load egress allow-list'
+        if: inputs.egress_policy == 'block'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: "${{ inputs.egress_allow_config }}"
+          allow_list_summary: 'true'
+
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: "${{ inputs.egress_policy }}"
+          allowed-endpoints: "${{ env.CONNECTION_ALLOW_LIST }}"
+
+      - name: 'Allocate invocation identity'
+        id: identity
+        env:
+          RUN_ID: "${{ github.run_id }}"
+          RUN_ATTEMPT: "${{ github.run_attempt }}"
+        run: |
+          python3 - <<'PY'
+          import os, uuid
+          run = os.environ['RUN_ID']
+          attempt = os.environ['RUN_ATTEMPT']
+          namespace = f"{run}-{attempt}-{uuid.uuid4().hex}"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'namespace={namespace}\n')
+          PY
+
+      - name: 'Check inputs'
+        id: budget
+        env:
+          MODE: "${{ inputs.mode }}"
+          MAX_ISSUES: "${{ inputs.max_issues }}"
+          MAX_RUNTIME: "${{ inputs.max_runtime_minutes }}"
+          MAX_AGENTS: "${{ inputs.max_concurrent_agents }}"
+          MODEL: "${{ inputs.model }}"
+          REPOSITORIES: "${{ inputs.repositories }}"
+        run: |
+          case "$MODE" in
+            select|branches|pull-requests) ;;
+            *) echo "::error::mode must be select, branches or pull-requests"
+               exit 1 ;;
+          esac
+          [[ "$MAX_ISSUES" =~ ^[0-9]+$ ]] || {
+            echo '::error::max_issues must be a non-negative integer'; exit 1; }
+          [[ "$MAX_RUNTIME" =~ ^[1-9][0-9]*$ ]] && [ "$MAX_RUNTIME" -le 330 ] ||
+            { echo '::error::max_runtime_minutes must be 1-330'; exit 1; }
+          [[ "$MAX_AGENTS" =~ ^[1-9][0-9]*$ ]] && [ "$MAX_AGENTS" -le 30 ] || {
+            echo '::error::max_concurrent_agents must be 1-30'; exit 1; }
+          [[ "$MODEL" =~ ^[a-z0-9.-]+$ ]] || {
+            echo '::error::model must be a lower-case identifier'; exit 1; }
+          # Expressions cannot add, so the job budget (session plus
+          # toolchain setup and upload) is computed here. The
+          # repository list is normalised to commas for the App token
+          # action, which does not split on spaces; empty keeps the
+          # read token organisation-wide, which the scan needs.
+          repositories="$(printf '%s' "$REPOSITORIES" | tr ', ' '\n' \
+            | grep -v '^$' | paste -sd, -)"
+          {
+            echo "agent_timeout=$MAX_RUNTIME"
+            echo "author_timeout=$((MAX_RUNTIME + 20))"
+            echo "max_parallel=$MAX_AGENTS"
+            echo "repositories=$repositories"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Require App for live runs'
+        # yamllint disable-line rule:line-length
+        if: ${{ !inputs.dry_run && inputs.mode != 'select' && inputs.github_app_client_id == '' }}
+        run: |
+          echo '::error::Live runs require organisation App credentials'
+          exit 1
+
+      - name: 'Mint read-only App token'
+        id: app-token
+        if: inputs.github_app_client_id != ''
+        # yamllint disable-line rule:line-length
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        # v3.2.0 forwards INPUT_PERMISSION-* but does not declare
+        # these org grants; env avoids main/post input warnings.
+        env:
+          INPUT_PERMISSION-ISSUE-FIELDS: 'read'
+          INPUT_PERMISSION-ISSUE-TYPES: 'read'
+        with:
+          client-id: "${{ inputs.github_app_client_id }}"
+          private-key: "${{ secrets.github_app_private_key }}"
+          owner: "${{ inputs.org }}"
+          # Empty means every repository of the owner: the candidate
+          # scan is organisation-wide by design and this token reads.
+          repositories: "${{ steps.budget.outputs.repositories }}"
+          permission-issues: 'read'
+          permission-metadata: 'read'
+          permission-contents: 'read'
+          permission-pull-requests: 'read'
+
+      - name: 'Resolve assets ref'
+        id: assets
+        env:
+          ASSETS_REF: "${{ inputs.assets_ref }}"
+          # yamllint disable-line rule:line-length
+          JOB_WORKFLOW_SHA: "${{ job.workflow_sha || github.job_workflow_sha }}"
+        run: |
+          ref="${ASSETS_REF:-$JOB_WORKFLOW_SHA}"
+          if [ -z "$ref" ]; then
+            echo '::error::Cannot resolve workflow commit; set assets_ref'
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: 'Checkout trusted assets'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "${{ inputs.assets_repository }}"
+          ref: "${{ steps.assets.outputs.ref }}"
+          path: 'monkey-assets'
+          persist-credentials: false
+
+      - name: 'Pin assets commit'
+        id: pinned
+        run: |
+          sha="$(git -C monkey-assets rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: 'Select issues'
+        env:
+          GH_TOKEN: "${{ steps.app-token.outputs.token || github.token }}"
+          ORG: "${{ inputs.org }}"
+          MODE: "${{ inputs.mode }}"
+          MODEL: "${{ inputs.model }}"
+          DRY_RUN: "${{ inputs.dry_run }}"
+          REPOSITORIES: "${{ inputs.repositories }}"
+          EXCLUDE_REPOS: "${{ inputs.exclude_repos }}"
+          INCLUDE_DOTGITHUB: "${{ inputs.include_dotgithub }}"
+          INCLUDE_ASSIGNED: "${{ inputs.include_assigned }}"
+          MAX_ISSUES: "${{ inputs.max_issues }}"
+          # yamllint disable-line rule:line-length
+          GUIDANCE_REPOSITORY: "${{ inputs.guidance_repository || format('{0}/.github', inputs.org) }}"
+          GUIDANCE_REF: "${{ inputs.guidance_ref }}"
+          BOT_SLUG: "${{ steps.app-token.outputs.app-slug }}"
+        run: |
+          extra=()
+          if [ "$DRY_RUN" = true ]; then extra+=(--dry-run); fi
+          if [ "$INCLUDE_DOTGITHUB" = true ]; then
+            extra+=(--include-dotgithub)
+          fi
+          if [ "$INCLUDE_ASSIGNED" = true ]; then
+            extra+=(--include-assigned)
+          fi
+          python3 monkey-assets/scripts/select_issues.py \
+            --org "$ORG" --output-dir artefacts \
+            --mode "$MODE" --model "$MODEL" \
+            --repositories "$REPOSITORIES" \
+            --exclude-file monkey-assets/config/excluded-repos.txt \
+            --exclude-repos "$EXCLUDE_REPOS" \
+            --max-issues "$MAX_ISSUES" \
+            --guidance-repository "$GUIDANCE_REPOSITORY" \
+            --guidance-ref "$GUIDANCE_REF" \
+            --bot-slug "$BOT_SLUG" "${extra[@]}"
+          cat artefacts/selection-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Publish selection outputs'
+        id: chosen
+        env:
+          MODE: "${{ inputs.mode }}"
+        run: |
+          count="$(jq '.include | length' artefacts/matrix.json)"
+          [[ "$count" =~ ^[0-9]+$ ]]
+          run_agent=false
+          if [ "$MODE" != select ] && [ "$count" != 0 ]; then
+            run_agent=true
+          fi
+          {
+            echo "count=$count"
+            echo "run_agent=$run_agent"
+            echo "matrix=$(jq -c . artefacts/matrix.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Record evidence digests'
+        id: digests
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for name, path in (('selection', 'selection.json'),
+                                 ('guidance', 'agents.md')):
+                  content = pathlib.Path('artefacts', path).read_bytes()
+                  output.write(f'{name}={hashlib.sha256(content).hexdigest()}\n')
+          PY
+
+      # Artifact IDs and file digests come from this trusted job.
+      # An artifact name alone is not an integrity boundary.
+      - name: 'Publish selection evidence'
+        id: evidence
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: "monkey-evidence-${{ steps.identity.outputs.namespace }}"
+          path: 'artefacts/'
+          retention-days: 7
+          if-no-files-found: 'error'
+
+  author:
+    name: 'Author (${{ matrix.key }})'
+    needs: 'select'
+    if: needs.select.outputs.run_agent == 'true'
+    runs-on: 'ubuntu-latest'
+    # Session budget plus toolchain setup and artifact upload.
+    timeout-minutes: ${{ fromJSON(needs.select.outputs.author_timeout) }}
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.select.outputs.max_parallel) }}
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      contents: read  # Checkout assets and the public target repository
+    steps:
+      # Always audit: the agent installs whatever toolchain the target
+      # repository's hooks pin, which no fixed allow-list can cover.
+      - name: 'Harden runner (audit)'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'audit'
+
+      - name: 'Require pinned assets'
+        env:
+          ASSETS_SHA: "${{ needs.select.outputs.assets_sha }}"
+          BASE_SHA: "${{ matrix.base_sha }}"
+          KEY: "${{ matrix.key }}"
+        run: |
+          [[ "$ASSETS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$KEY" =~ ^[A-Za-z0-9_.-]+$ ]]
+
+      - name: 'Checkout prompt assets'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "${{ inputs.assets_repository }}"
+          ref: "${{ needs.select.outputs.assets_sha }}"
+          path: 'monkey-assets'
+          persist-credentials: false
+
+      - name: 'Fetch selection evidence'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: "${{ needs.select.outputs.evidence_id }}"
+          merge-multiple: true
+          path: 'evidence'
+
+      - name: 'Verify evidence bytes'
+        env:
+          SELECTION_SHA: "${{ needs.select.outputs.selection_sha256 }}"
+          GUIDANCE_SHA: "${{ needs.select.outputs.guidance_sha256 }}"
+        run: |
+          python3 monkey-assets/scripts/monkey_evidence.py verify \
+            --directory evidence --selection-sha256 "$SELECTION_SHA" \
+            --guidance-sha256 "$GUIDANCE_SHA"
+
+      # The default token has no grant on the target repository; the
+      # checkout succeeds because the estate is public. Nothing here
+      # can push (docs/DESIGN.md section 4.1).
+      - name: 'Checkout target repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "${{ matrix.repository }}"
+          ref: "${{ matrix.base_sha }}"
+          path: 'workspace'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Set up Node.js'
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: 'Set up uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+
+      - name: 'Install agent toolchain'
+        run: |  # zizmor: ignore[adhoc-packages] exact versions pinned
+          npm install -g "@github/copilot@$COPILOT_CLI_VERSION" 'aislop@0.14.1'
+          uv tool install 'prek==0.4.10'
+
+      - name: 'Prepare workspace and packet'
+        id: packet
+        env:
+          KEY: "${{ matrix.key }}"
+          BASE_SHA: "${{ matrix.base_sha }}"
+        run: |
+          mkdir -p artefacts
+          jq -e --arg key "$KEY" '.issues[] | select(.key == $key)' \
+            evidence/selection.json > artefacts/issue.json
+          bot_login="$(jq -r '.bot.login' evidence/selection.json)"
+          bot_email="$(jq -r '.bot.email' evidence/selection.json)"
+          [[ "$bot_login" =~ ^[A-Za-z0-9_.\[\]-]+$ ]]
+          [[ "$bot_email" =~ ^[A-Za-z0-9_.+\[\]@-]+$ ]]
+          git -C workspace config user.name "$bot_login"
+          git -C workspace config user.email "$bot_email"
+          git -C workspace config commit.gpgsign false
+          [ "$(git -C workspace rev-parse HEAD)" = "$BASE_SHA" ]
+          {
+            echo "bot_login=$bot_login"
+            echo "branch=$(jq -r '.branch' artefacts/issue.json)"
+            echo "repository=$(jq -r '.repository' artefacts/issue.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Assemble prompt'
+        env:
+          REPOSITORY: "${{ steps.packet.outputs.repository }}"
+          BRANCH: "${{ steps.packet.outputs.branch }}"
+          BASE_SHA: "${{ matrix.base_sha }}"
+          BOT_LOGIN: "${{ steps.packet.outputs.bot_login }}"
+          MODE: "${{ inputs.mode }}"
+        run: |
+          artefacts="$(pwd)/artefacts"
+          cp evidence/agents.md "$artefacts/agents.md"
+          local_stub='absent'
+          if [ -f workspace/AGENTS.md ]; then
+            local_stub='present: AGENTS.md'
+          fi
+          # shellcheck disable=SC2016  # literal backticks for markdown
+          {
+            cat monkey-assets/prompt/author.md
+            printf '\n## Runtime context\n\n'
+            printf -- '- repository: `%s`\n' "$REPOSITORY"
+            printf -- '- base_sha: `%s`\n' "$BASE_SHA"
+            printf -- '- branch: `%s`\n' "$BRANCH"
+            printf -- '- bot identity: `%s` (configured in git)\n' "$BOT_LOGIN"
+            printf -- '- mode: `%s`\n' "$MODE"
+            printf -- '- issue packet: `%s/issue.json`\n' "$artefacts"
+            printf -- '- organisation guidance: `%s/agents.md`\n' "$artefacts"
+            printf -- '- repository AGENTS.md: %s\n' "$local_stub"
+            printf -- '- artefacts directory (write manifest.json here):'
+            printf -- ' `%s`\n' "$artefacts"
+          } > artefacts/prompt.md
+
+      - name: 'Run coding agent (Copilot)'
+        id: agent
+        timeout-minutes: ${{ fromJSON(needs.select.outputs.agent_timeout) }}
+        env:
+          COPILOT_GITHUB_TOKEN: "${{ secrets.copilot_token }}"
+          COPILOT_HOME: "${{ runner.temp }}/copilot"
+          MODEL: "${{ inputs.model }}"
+          ALLOW_SUBAGENTS: "${{ inputs.allow_subagents }}"
+          LOAD_REPO_SKILLS: "${{ inputs.load_repo_skills }}"
+        run: |
+          # The prefix rejects native/classic tokens, not extra PAT
+          # grants. The caller must provision Copilot Requests only.
+          case "$COPILOT_GITHUB_TOKEN" in
+            github_pat_*) ;;
+            *)
+              echo '::error::Use a model-only fine-grained Copilot PAT'
+              exit 1 ;;
+          esac
+          artefacts="$(pwd)/artefacts"
+          mkdir -p "$artefacts/copilot-logs"
+          prompt="$(cat "$artefacts/prompt.md")"
+          # gh is denied because the agent has nothing to authenticate
+          # with and a failing call reads to the model like a bug to
+          # route around. Everything else the agent needs -- git, the
+          # write tool, interpreters -- is a bypass of shell-level
+          # denials anyway (docs/DESIGN.md 4.1); containment is the
+          # missing credential, not this list.
+          deny='shell(gh),shell(gh:*),shell(git push),shell(git push:*)'
+          if [ "$ALLOW_SUBAGENTS" != true ]; then
+            deny="$deny,task,list_agents,read_agent,write_agent"
+          fi
+          if [ "$LOAD_REPO_SKILLS" != true ]; then
+            deny="$deny,skill"
+          fi
+          cd workspace
+          copilot \
+            --prompt="$prompt" \
+            --model="$MODEL" \
+            --mode autopilot \
+            --allow-all-tools \
+            --deny-tool="$deny" \
+            --add-dir "$artefacts" \
+            --secret-env-vars=COPILOT_GITHUB_TOKEN \
+            --no-ask-user --no-custom-instructions --disable-builtin-mcps \
+            --no-auto-update --no-color \
+            --log-dir="$artefacts/copilot-logs" \
+            --usage-output-file "$artefacts/usage.json" \
+            --share="$artefacts/session-summary.md"
+
+      # The workflow, not the agent, turns the branch into a bundle and
+      # supplies a manifest when the agent left none, so the publisher
+      # always has something typed to report on.
+      - name: 'Bundle proposed commits'
+        if: always() && steps.packet.outcome == 'success'
+        env:
+          BRANCH: "${{ steps.packet.outputs.branch }}"
+          BASE_SHA: "${{ matrix.base_sha }}"
+          REPOSITORY: "${{ steps.packet.outputs.repository }}"
+          ISSUE: "${{ matrix.number }}"
+          AGENT_OUTCOME: "${{ steps.agent.outcome }}"
+        run: |
+          # shellcheck disable=SC2016  # jq variables, not shell expansions
+          if [ ! -s artefacts/manifest.json ]; then
+            jq -n --arg repo "$REPOSITORY" --argjson issue "$ISSUE" \
+              --arg base "$BASE_SHA" --arg branch "$BRANCH" \
+              --arg outcome "$AGENT_OUTCOME" '{
+                schema: 1, outcome: "author-failed",
+                repository: $repo, issue: $issue, base_sha: $base,
+                branch: $branch,
+                reason: ("the agent session ended with outcome " + $outcome
+                         + " and left no manifest")
+              }' > artefacts/manifest.json
+          fi
+          outcome="$(jq -r '.outcome' artefacts/manifest.json)"
+          if [ "$outcome" = proposed ]; then
+            ref="refs/heads/$BRANCH"
+            if git -C workspace rev-parse --verify -q "$ref" > /dev/null; then
+              git -C workspace bundle create "$(pwd)/artefacts/changes.bundle" \
+                "$BASE_SHA..$ref"
+            else
+              echo "::warning::manifest says proposed but $ref is absent"
+            fi
+          fi
+          echo "Manifest outcome: $outcome"
+
+      - name: 'Publish proposal'
+        id: proposal
+        if: always() && steps.packet.outcome == 'success'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # yamllint disable-line rule:line-length
+          name: "monkey-proposal-${{ needs.select.outputs.namespace }}-${{ matrix.key }}"
+          path: |
+            artefacts/manifest.json
+            artefacts/changes.bundle
+            artefacts/usage.json
+          retention-days: 7
+          if-no-files-found: 'error'
+
+      - name: 'Preserve session output'
+        if: always()
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # yamllint disable-line rule:line-length
+          name: "monkey-session-${{ needs.select.outputs.namespace }}-${{ matrix.key }}-${{ github.run_attempt }}"
+          path: |
+            artefacts/session-summary.md
+            artefacts/prompt.md
+            artefacts/copilot-logs/
+          retention-days: 7
+          if-no-files-found: 'warn'
+
+      # Hygiene, not secure erasure (docs/DESIGN.md section 3):
+      # plain deletion of the CLI's spilled tool output, its home and
+      # the checkout, on a single-use VM. continue-on-error because
+      # cleanup must never gate the publish path.
+      - name: 'Clear session scratch files'
+        if: always()
+        continue-on-error: true
+        env:
+          COPILOT_HOME: "${{ runner.temp }}/copilot"
+        run: |
+          scratch="${TMPDIR:-/tmp}"
+          found=$(find "$scratch" -maxdepth 1 -type f \
+            -name '*-copilot-tool-output-*' -print -delete)
+          removed=0
+          if [ -n "$found" ]; then
+            removed=$(printf '%s\n' "$found" | wc -l | tr -d '[:space:]')
+          fi
+          rm -rf "$COPILOT_HOME" workspace
+          echo "Cleared $removed spilled tool-output file(s), the CLI home" \
+            "and the checkout."
+
+  publish:
+    name: 'Publish (${{ matrix.key }})'
+    needs: [select, author]
+    # Runs after every author entry, including failed ones, so each
+    # issue gets a verdict; never after cancellation or a failed
+    # selection.
+    if: >-
+      !cancelled() && needs.select.result == 'success' &&
+      needs.select.outputs.run_agent == 'true'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      actions: read  # Locate the author artifact for this matrix key
+      contents: read  # Checkout trusted publisher; fetch public base commit
+    steps:
+      - name: 'Load egress allow-list'
+        if: inputs.egress_policy == 'block'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: "${{ inputs.egress_allow_config }}"
+          allow_list_summary: 'false'
+
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: "${{ inputs.egress_policy }}"
+          allowed-endpoints: "${{ env.CONNECTION_ALLOW_LIST }}"
+
+      - name: 'Require trusted provenance'
+        env:
+          ASSETS_SHA: "${{ needs.select.outputs.assets_sha }}"
+          EVIDENCE_ID: "${{ needs.select.outputs.evidence_id }}"
+          SELECTION_SHA: "${{ needs.select.outputs.selection_sha256 }}"
+          GUIDANCE_SHA: "${{ needs.select.outputs.guidance_sha256 }}"
+          KEY: "${{ matrix.key }}"
+        run: |
+          [[ "$ASSETS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EVIDENCE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$SELECTION_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$GUIDANCE_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$KEY" =~ ^[A-Za-z0-9_.-]+$ ]]
+
+      - name: 'Checkout trusted publisher'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "${{ inputs.assets_repository }}"
+          ref: "${{ needs.select.outputs.assets_sha }}"
+          path: 'monkey-assets'
+          persist-credentials: false
+
+      - name: 'Fetch selection evidence'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          artifact-ids: "${{ needs.select.outputs.evidence_id }}"
+          merge-multiple: true
+          path: 'evidence'
+
+      - name: 'Verify evidence bytes'
+        id: verified
+        env:
+          SELECTION_SHA: "${{ needs.select.outputs.selection_sha256 }}"
+          GUIDANCE_SHA: "${{ needs.select.outputs.guidance_sha256 }}"
+        run: |
+          python3 monkey-assets/scripts/monkey_evidence.py verify \
+            --directory evidence --selection-sha256 "$SELECTION_SHA" \
+            --guidance-sha256 "$GUIDANCE_SHA"
+
+      # The proposal is untrusted whatever its name; the publisher
+      # cross-checks its content against the verified selection. A
+      # missing artifact means the author job never got that far.
+      - name: 'Fetch untrusted proposal'
+        id: fetch
+        continue-on-error: true
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          # yamllint disable-line rule:line-length
+          name: "monkey-proposal-${{ needs.select.outputs.namespace }}-${{ matrix.key }}"
+          path: 'untrusted-proposal'
+
+      - name: 'Accept bounded proposal files'
+        env:
+          FETCHED: "${{ steps.fetch.outcome }}"
+          REPOSITORY: "${{ matrix.repository }}"
+          ISSUE: "${{ matrix.number }}"
+          BASE_SHA: "${{ matrix.base_sha }}"
+          BRANCH: "${{ matrix.branch }}"
+        run: |
+          # shellcheck disable=SC2016  # jq variables, not shell expansions
+          mkdir -p accepted
+          if [ "$FETCHED" = success ]; then
+            python3 monkey-assets/scripts/monkey_evidence.py accept \
+              --directory untrusted-proposal --output accepted
+          else
+            jq -n --arg repo "$REPOSITORY" --argjson issue "$ISSUE" \
+              --arg base "$BASE_SHA" --arg branch "$BRANCH" '{
+                schema: 1, outcome: "author-failed",
+                repository: $repo, issue: $issue, base_sha: $base,
+                branch: $branch,
+                reason: "the author job produced no proposal artifact"
+              }' > accepted/manifest.json
+          fi
+
+      - name: 'Check proposal offline'
+        id: check
+        env:
+          KEY: "${{ matrix.key }}"
+          # yamllint disable-line rule:line-length
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 monkey-assets/scripts/publish.py check \
+            --selection evidence/selection.json --key "$KEY" \
+            --proposal-dir accepted --workdir work \
+            --coauthors monkey-assets/config/coauthors.json \
+            --output artefacts/check.json \
+            --summary artefacts/check-summary.md \
+            --run-url "$RUN_URL"
+          cat artefacts/check-summary.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "verdict=$(jq -r .verdict artefacts/check.json)"
+            echo "needs_workflows=$(jq -r .needs_workflows \
+              artefacts/check.json)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 'Mint repository write token'
+        id: write-token
+        if: >-
+          !inputs.dry_run && steps.check.outputs.verdict == 'proposed' &&
+          inputs.github_app_client_id != ''
+        # yamllint disable-line rule:line-length
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: "${{ inputs.github_app_client_id }}"
+          private-key: "${{ secrets.github_app_private_key }}"
+          owner: "${{ inputs.org }}"
+          repositories: "${{ matrix.repository }}"
+          permission-contents: 'write'
+          permission-metadata: 'read'
+          # yamllint disable-line rule:line-length
+          permission-pull-requests: "${{ inputs.mode == 'pull-requests' && 'write' || 'read' }}"
+          # yamllint disable-line rule:line-length
+          permission-workflows: "${{ steps.check.outputs.needs_workflows == 'true' && 'write' || '' }}"
+
+      - name: 'Publish branch and pull request'
+        id: apply
+        env:
+          GH_TOKEN: "${{ steps.write-token.outputs.token }}"
+          MODE: "${{ inputs.mode }}"
+          DRY_RUN: "${{ inputs.dry_run }}"
+        run: |
+          extra=()
+          if [ "$DRY_RUN" = true ]; then extra+=(--dry-run); fi
+          python3 monkey-assets/scripts/publish.py apply \
+            --check artefacts/check.json --workdir work \
+            --mode "$MODE" --output artefacts/result.json "${extra[@]}"
+
+      - name: 'Mint issue comment token'
+        id: comment-token
+        if: ${{ !inputs.dry_run && inputs.github_app_client_id != '' }}
+        # yamllint disable-line rule:line-length
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: "${{ inputs.github_app_client_id }}"
+          private-key: "${{ secrets.github_app_private_key }}"
+          owner: "${{ inputs.org }}"
+          repositories: "${{ matrix.repository }}"
+          permission-issues: 'write'
+          permission-metadata: 'read'
+
+      - name: 'Comment on the issue'
+        if: ${{ !inputs.dry_run && inputs.github_app_client_id != '' }}
+        env:
+          GH_TOKEN: "${{ steps.comment-token.outputs.token }}"
+          # yamllint disable-line rule:line-length
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 monkey-assets/scripts/publish.py comment \
+            --result artefacts/result.json --run-url "$RUN_URL"
+
+      - name: 'Attach publish result'
+        if: always()
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # yamllint disable-line rule:line-length
+          name: "monkey-result-${{ needs.select.outputs.namespace }}-${{ matrix.key }}-${{ github.run_attempt }}"
+          path: |
+            artefacts/check.json
+            artefacts/check-summary.md
+            artefacts/result.json
+          retention-days: 90
+          if-no-files-found: 'warn'
+
+  report:
+    name: 'Report'
+    needs: [select, author, publish]
+    if: ${{ !cancelled() && needs.select.result == 'success' }}
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 10
+    permissions:
+      actions: read  # Gather per-issue result artifacts
+      contents: read  # Checkout the report script
+    steps:
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: "${{ inputs.egress_policy }}"
+          allowed-endpoints: "${{ env.CONNECTION_ALLOW_LIST }}"
+
+      - name: 'Checkout report script'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: "${{ inputs.assets_repository }}"
+          ref: "${{ needs.select.outputs.assets_sha }}"
+          path: 'monkey-assets'
+          persist-credentials: false
+
+      - name: 'Gather results'
+        if: needs.select.outputs.run_agent == 'true'
+        # yamllint disable-line rule:line-length
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: "monkey-result-${{ needs.select.outputs.namespace }}-*"
+          path: 'results'
+
+      - name: 'Build report'
+        env:
+          AUTHOR_RESULT: "${{ needs.author.result }}"
+          PUBLISH_RESULT: "${{ needs.publish.result }}"
+        run: |
+          mkdir -p results artefacts
+          python3 monkey-assets/scripts/publish.py report \
+            --results results --output-md artefacts/report.md \
+            --output-json artefacts/report.json
+          cat artefacts/report.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\nAuthor job: %s; publish job: %s\n' \
+            "$AUTHOR_RESULT" "$PUBLISH_RESULT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 'Attach run report'
+        # yamllint disable-line rule:line-length
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # yamllint disable-line rule:line-length
+          name: "code-monkey-${{ needs.select.outputs.namespace }}-${{ github.run_attempt }}"
+          path: 'artefacts/'
+          retention-days: 90
+          if-no-files-found: 'warn'

@@ -114,6 +114,14 @@ repos:
     rev: c04ed26e40637cab1aa9879c693832a9c120fb20  # frozen: v1.7.12.24
     hooks:
       - id: actionlint
+        # actionlint 1.7.12 predates GitHub's self-repository syntax.
+        # Keep every other check; limit this compatibility exception
+        # to the one local callee, checked by the offline suite too.
+        # https://github.com/rhysd/actionlint/issues/711
+        args:
+          - '-ignore'
+          # yamllint disable-line rule:line-length
+          - '^reusable workflow call "\$/\.github/workflows/code-monkey\.yaml" at "uses" is not following the format '
 
   # Check for misspellings in documentation files
   - repo: https://github.com/codespell-project/codespell

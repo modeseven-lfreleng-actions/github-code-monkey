@@ -1,0 +1,143 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Scheduled and on-demand entry point for the reusable workflow.
+#
+# The schedule runs two hours after the daily issues triage
+# (github-issues-triage, 07:00 UTC weekdays) so Priority and Type are
+# in place before selection. It stays in dry-run until the rollout
+# in docs/DESIGN.md section 15 clears live operation; flip the
+# `dry_run` expression below at that point. Disabling this workflow
+# in the Actions UI is the kill switch.
+name: 'Code Monkey ⏰'
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    - cron: '0 9 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run the agent but publish nothing'
+        type: boolean
+        default: true
+      model:
+        description: 'Model'
+        type: choice
+        options:
+          - 'Claude Opus 5'
+          - 'Claude Fable 5.1'
+          - 'Claude Sonnet 5'
+          - 'GPT-6 Astra'
+        default: 'Claude Opus 5'
+      mode:
+        description: 'How far to take each issue'
+        type: choice
+        options:
+          - 'select'
+          - 'branches'
+          - 'pull-requests'
+        default: 'pull-requests'
+      max_issues:
+        description: 'Issues to work (0 = unbounded)'
+        type: string
+        default: '10'
+      max_runtime_minutes:
+        description: 'Minutes each agent may run'
+        type: string
+        default: '180'
+      max_concurrent_agents:
+        description: 'Agents at once (1-30)'
+        type: string
+        default: '10'
+      allow_subagents:
+        description: 'Allow the agent to spawn sub-agents'
+        type: boolean
+        default: true
+      include_dotgithub:
+        description: 'Include issues from the .github repository'
+        type: boolean
+        default: false
+      include_assigned:
+        description: 'Include issues that already have an assignee'
+        type: boolean
+        default: false
+      load_repo_skills:
+        description: 'Trust skills found in the target checkout'
+        type: boolean
+        default: false
+      repositories:
+        description: 'Repositories to scan (commas and/or spaces)'
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: 'code-monkey'
+  cancel-in-progress: false
+
+jobs:
+  model:
+    name: 'Resolve model'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      id: "${{ steps.map.outputs.id }}"
+    steps:
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+
+      # Display names in the dispatch form map to the identifiers
+      # docs/DESIGN.md section 10.3 checked against the CLI.
+      - name: 'Map display name to identifier'
+        id: map
+        env:
+          MODEL: "${{ inputs.model || 'Claude Opus 5' }}"
+        run: |
+          case "$MODEL" in
+            'Claude Opus 5') id='claude-opus-5' ;;
+            'Claude Fable 5.1') id='claude-fable-5.1' ;;
+            'Claude Sonnet 5') id='claude-sonnet-5' ;;
+            'GPT-6 Astra') id='gpt-6-astra' ;;
+            *) echo "::error::Unknown model $MODEL"; exit 1 ;;
+          esac
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  code-monkey:
+    name: 'Code Monkey'
+    needs: 'model'
+    permissions:
+      issues: read  # Candidate scan when running without the App
+      contents: read  # Asset checkout and public repository reads
+      actions: read  # Publish and report jobs locate artifacts
+    uses: $/.github/workflows/code-monkey.yaml
+    with:
+      org: "${{ github.repository_owner }}"
+      mode: "${{ inputs.mode || 'pull-requests' }}"
+      # Scheduled runs stay dry-run until the rollout clears them.
+      dry_run: >-
+        ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
+      model: "${{ needs.model.outputs.id }}"
+      max_issues: "${{ inputs.max_issues || '10' }}"
+      max_runtime_minutes: "${{ inputs.max_runtime_minutes || '180' }}"
+      max_concurrent_agents: "${{ inputs.max_concurrent_agents || '10' }}"
+      allow_subagents: >-
+        ${{ github.event_name != 'workflow_dispatch'
+            || inputs.allow_subagents }}
+      include_dotgithub: ${{ inputs.include_dotgithub || false }}
+      include_assigned: ${{ inputs.include_assigned || false }}
+      load_repo_skills: ${{ inputs.load_repo_skills || false }}
+      repositories: "${{ inputs.repositories || '' }}"
+      egress_policy: 'audit'
+      github_app_client_id: "${{ vars.LF_CODE_MONKEY_CLIENT_ID || '' }}"
+      assets_repository: "${{ github.repository }}"
+      assets_ref: "${{ github.sha }}"
+    secrets:
+      copilot_token: "${{ secrets.COPILOT_CLI_TOKEN }}"
+      github_app_private_key: "${{ secrets.LF_CODE_MONKEY_PRIVATE_KEY }}"

@@ -1,0 +1,109 @@
+---
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+name: 'Testing 🧪'
+
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      repositories:
+        description: 'Repositories for the manual dry-run (commas/spaces)'
+        type: string
+        default: ''
+      max_issues:
+        description: 'Issues to attempt in the manual dry-run'
+        type: string
+        default: '1'
+
+permissions: {}
+
+concurrency:
+  group: "testing-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  # Exercises the select job and the matrix plumbing without an App,
+  # a model token or an agent session. Two invocations prove that the
+  # invocation namespace keeps artifact names apart in one run.
+  plumbing:
+    name: 'Plumbing (secretless, ${{ matrix.invocation }})'
+    strategy:
+      matrix:
+        invocation: [first, second]
+    if: github.event_name == 'pull_request'
+    permissions:
+      issues: read  # Candidate scan
+      contents: read  # Asset checkout and public repository reads
+      actions: read  # Report job artifact lookup
+    uses: $/.github/workflows/code-monkey.yaml
+    with:
+      org: "${{ github.repository_owner }}"
+      mode: 'select'
+      dry_run: true
+      max_issues: '3'
+      egress_policy: 'audit'
+      # The organisation guidance exists on the fork branch behind
+      # lfreleng-actions/.github PR 206 until it merges. Switch both
+      # values to "${{ github.repository_owner }}/.github" and 'main'
+      # at that point; the reusable workflow defaults to those.
+      guidance_repository: 'modeseven-lfreleng-actions/.github'
+      guidance_ref: 'docs/org-wide-agents-guidance'
+      assets_repository: >-
+        ${{ github.event.pull_request.head.repo.full_name }}
+      assets_ref: "${{ github.event.pull_request.head.sha }}"
+
+  # A full dry-run: the agent works the selected issues and the
+  # publisher verifies the result without writing anything.
+  dry-run:
+    name: 'Agent dry-run (manual)'
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      issues: read  # Candidate scan
+      contents: read  # Asset checkout and public repository reads
+      actions: read  # Publish and report jobs locate artifacts
+    uses: $/.github/workflows/code-monkey.yaml
+    with:
+      org: "${{ github.repository_owner }}"
+      mode: 'pull-requests'
+      dry_run: true
+      model: 'claude-sonnet-5'
+      max_issues: "${{ inputs.max_issues || '1' }}"
+      max_runtime_minutes: '60'
+      max_concurrent_agents: '2'
+      repositories: "${{ inputs.repositories || '' }}"
+      egress_policy: 'audit'
+      # Same interim source as the plumbing job above.
+      guidance_repository: 'modeseven-lfreleng-actions/.github'
+      guidance_ref: 'docs/org-wide-agents-guidance'
+      assets_repository: "${{ github.repository }}"
+      assets_ref: "${{ github.sha }}"
+    secrets:
+      copilot_token: "${{ secrets.COPILOT_CLI_TOKEN }}"
+
+  regression:
+    name: 'Offline regression tests'
+    runs-on: 'ubuntu-latest'
+    timeout-minutes: 10
+    permissions:
+      contents: read  # Test checked-out code without write credentials
+    steps:
+      - name: 'Harden runner'
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'audit'
+      - name: 'Checkout repository'
+        # yamllint disable-line rule:line-length
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 'Install uv'
+        # yamllint disable-line rule:line-length
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+      - name: 'Run offline regression suite'
+        run: uv run --locked python -B -m unittest discover -s tests -v
