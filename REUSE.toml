@@ -1,0 +1,16 @@
+version = 1
+
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Licensing for files that cannot carry an inline SPDX header, so
+# REUSE lint passes. uv regenerates uv.lock wholesale, which would
+# discard a header; JSON has no comment syntax.
+
+[[annotations]]
+path = [
+    "uv.lock",
+    "config/coauthors.json",
+]
+SPDX-License-Identifier = "Apache-2.0"
+SPDX-FileCopyrightText = "2026 The Linux Foundation"

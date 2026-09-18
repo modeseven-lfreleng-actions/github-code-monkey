@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Tool configuration for the helper scripts in scripts/. This
+# repository is not a Python package; the file exists so the
+# type-checker runs in strict mode and the test suite has a locked
+# environment to run in.
+
+[project]
+name = "github-code-monkey-checks"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = ["PyYAML==6.0.3"]
+
+[tool.basedpyright]
+typeCheckingMode = "strict"

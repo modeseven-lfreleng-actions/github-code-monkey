@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# Repositories the scheduled run never works. One name per line,
+# '#' starts a comment. The reusable workflow's exclude_repos input
+# overrides this list; naming repositories explicitly bypasses it.
+#
+# Seeded from github-issues-triage/config/excluded-repos.txt.
+project-reporting-artifacts
+test-tags-calver
+test-tags-semantic
