@@ -30,10 +30,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
+import issue_comment as comments
 import monkey_github as github
 import proposal_check as checks
 import proposal_model as model
 import proposal_policy as policy
+import proposal_report as reporting
 from proposal_policy import PublishError, Rejection
 
 SCHEMA = 1
@@ -76,6 +78,63 @@ def create_branch(repository: str, branch: str, base_sha: str) -> None:
         if exc.status == 422 and "already exists" in str(exc).lower():
             raise Rejection(f"branch {branch} already exists") from exc
         raise PublishError(str(exc)) from exc
+
+
+def existing_pull_request(repository: str, branch: str) -> str | None:
+    """The URL of a pull request already open from this repository's branch.
+
+    A rerun of a publish job whose first attempt opened the pull
+    request and then failed later (the comment, the upload) meets the
+    branch it made. That is the run's own earlier success, not a
+    conflict, so it is reported as published rather than rejected.
+    """
+    raw = github.run_gh(
+        [
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--limit",
+            "20",
+            "--json",
+            "url,isCrossRepository",
+        ]
+    )
+    parsed = github.decode_response(raw)
+    if not isinstance(parsed, list):
+        raise github.GitHubError("expected a pull request array")
+    for entry in cast("list[Any]", parsed):
+        if isinstance(entry, dict):
+            data = cast("dict[str, Any]", entry)
+            url = data.get("url")
+            if data.get("isCrossRepository") is False and isinstance(url, str):
+                return url
+    return None
+
+
+def delete_branch(repository: str, branch: str) -> str | None:
+    """Remove the bot branch after a failed publication; return a note on failure.
+
+    A half-built branch would otherwise count as a prior attempt (the
+    selector checks for the branch) and keep the issue out of every
+    later run. Deletion is best effort: the original failure is what
+    the caller reports, and a leftover branch is recorded beside it.
+    """
+    try:
+        github.run_gh(
+            ["api", "--method", "DELETE", f"repos/{repository}/git/refs/heads/{branch}"]
+        )
+    except github.GitHubError as exc:
+        # After an ambiguous create the branch may never have existed;
+        # GitHub answers 404 or 422 "Reference does not exist" then.
+        if github.is_absent(exc) or "does not exist" in str(exc).lower():
+            return None
+        return f"branch {branch} could not be removed after the failure: {exc}"
+    return None
 
 
 def replay_commits(clone: Path, check: dict[str, Any]) -> list[str]:
@@ -178,154 +237,43 @@ def run_apply(args: argparse.Namespace) -> dict[str, Any]:
     repository = str(check["repository"])
     branch = str(check["branch"])
     try:
+        # Inside the rollback boundary: a create whose reply is lost
+        # may still have made the ref, which would strand the issue.
         create_branch(repository, branch, str(check["base_sha"]))
+        result["commits"] = replay_commits(args.workdir / "clone", check)
+        if args.mode == "pull-requests":
+            url, warning = open_pull_request(check)
+            result["pull_request_url"] = url
+            if warning:
+                cast("list[str]", result["warnings"]).append(warning)
     except Rejection as exc:
+        # The branch already existed. If an earlier attempt of this run
+        # opened its pull request, report that; otherwise it is not
+        # ours to touch. Either way, leave the branch alone.
+        earlier = existing_pull_request(repository, branch)
+        if earlier is not None:
+            result["pull_request_url"] = earlier
+            result["branch_url"] = f"https://github.com/{repository}/tree/{branch}"
+            result["already_published"] = True
+            cast("list[str]", result["warnings"]).append(
+                "an earlier attempt already published this pull request"
+            )
+            return result
         result["verdict"] = "rejected"
         cast("list[str]", result["reasons"]).append(str(exc))
         return result
+    except (PublishError, github.GitHubError) as exc:
+        # Roll the branch back so the issue stays eligible, then fail
+        # the step: this is the publisher unable to do its job.
+        leftover = delete_branch(repository, branch)
+        detail = str(exc) + (f"; {leftover}" if leftover else "; branch removed")
+        result["verdict"] = "publish-failed"
+        cast("list[str]", result["reasons"]).append(detail)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        raise PublishError(detail) from exc
     result["branch_url"] = f"https://github.com/{repository}/tree/{branch}"
-    result["commits"] = replay_commits(args.workdir / "clone", check)
-    if args.mode == "pull-requests":
-        url, warning = open_pull_request(check)
-        result["pull_request_url"] = url
-        if warning:
-            cast("list[str]", result["warnings"]).append(warning)
     return result
-
-
-def _proposed_comment(
-    result: dict[str, Any], _reasons: str, _run_url: str
-) -> str | None:
-    url = result.get("pull_request_url") or result.get("branch_url")
-    if not url:
-        return None
-    noun = "pull request" if result.get("pull_request_url") else "branch"
-    return f"🐒 An AI agent has proposed a change for this issue: {noun} {url}"
-
-
-def _abstain_comment(_result: dict[str, Any], reasons: str, _run_url: str) -> str:
-    return f"🐒 An AI agent looked at this issue and did not attempt it: {reasons}"
-
-
-def _rejected_comment(_result: dict[str, Any], reasons: str, run_url: str) -> str:
-    return (
-        "🐒 An AI agent attempted this issue but its proposal failed a policy "
-        f"check ({reasons}). Run: {run_url or 'n/a'}"
-    )
-
-
-def _failed_comment(_result: dict[str, Any], reasons: str, run_url: str) -> str:
-    return (
-        "🐒 An AI agent attempted this issue but did not finish "
-        f"({reasons}). Run: {run_url or 'n/a'}"
-    )
-
-
-COMMENTS: dict[str, Callable[[dict[str, Any], str, str], str | None]] = {
-    "proposed": _proposed_comment,
-    "abstain": _abstain_comment,
-    "rejected": _rejected_comment,
-    "author-failed": _failed_comment,
-}
-
-
-def comment_body(result: dict[str, Any], run_url: str) -> str | None:
-    """One line for the issue, or None when there is nothing worth saying."""
-    template = COMMENTS.get(str(result.get("verdict")))
-    if template is None:
-        return None
-    reasons = "; ".join(str(r) for r in cast("list[Any]", result.get("reasons") or []))
-    return template(result, reasons, run_url)
-
-
-def run_comment(args: argparse.Namespace) -> None:
-    """Post the outcome comment and record its URL in result.json."""
-    result = model.load_json(args.result, "result")
-    if result.get("dry_run"):
-        print("dry run: no comment")
-        return
-    body = comment_body(result, args.run_url)
-    if body is None:
-        print("nothing to comment")
-        return
-    repository = github.require_str(result, "repository", "result")
-    issue = github.require_int(result, "issue", "result")
-    data = github.api_write(
-        "POST", f"repos/{repository}/issues/{issue}/comments", {"body": body}
-    )
-    result["comment_url"] = data.get("html_url")
-    args.result.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-
-
-def report_row(item: dict[str, Any]) -> str:
-    """One table row for a result."""
-    verdict = str(item.get("verdict"))
-    requests = item.get("premium_requests")
-    output = item.get("pull_request_url") or item.get("branch_url") or "—"
-    if item.get("dry_run") and verdict == "proposed":
-        output = "dry run"
-    notes = [str(r) for r in cast("list[Any]", item.get("reasons") or [])]
-    notes += [str(w) for w in cast("list[Any]", item.get("warnings") or [])]
-    detail = "; ".join(notes).replace("|", "\\|")[:300] or str(
-        item.get("pr_title") or ""
-    )
-    return (
-        f"| {item.get('repository')}#{item.get('issue')} | {verdict} | {output} "
-        f"| {requests if requests is not None else '—'} | {detail} |"
-    )
-
-
-def run_report(args: argparse.Namespace) -> None:
-    """Merge every result.json into one table."""
-    results: list[dict[str, Any]] = []
-    unreadable: list[str] = []
-    for path in sorted(args.results.rglob("result.json")):
-        try:
-            results.append(model.load_json(path, str(path)))
-        except PublishError as exc:
-            unreadable.append(str(exc))
-    lines = [
-        "## Code monkey results",
-        "",
-        "| Issue | Verdict | Output | Premium requests | Detail |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    totals: dict[str, int] = dict.fromkeys(policy.VERDICTS, 0)
-    spend = 0
-    for item in results:
-        verdict = str(item.get("verdict"))
-        totals[verdict] = totals.get(verdict, 0) + 1
-        requests = item.get("premium_requests")
-        if type(requests) is int:
-            spend += requests
-        lines.append(report_row(item))
-    for problem in unreadable:
-        lines.append(f"| — | unreadable | — | — | {problem.replace('|', '/')[:300]} |")
-    if not results and not unreadable:
-        lines.append("| — | — | — | — | no proposals |")
-    lines += [
-        "",
-        f"Proposed {totals['proposed']}, abstained {totals['abstain']}, "
-        f"rejected {totals['rejected']}, failed {totals['author-failed']}; "
-        f"premium requests {spend}.",
-        "",
-    ]
-    args.output_md.parent.mkdir(parents=True, exist_ok=True)
-    args.output_md.write_text("\n".join(lines), encoding="utf-8")
-    args.output_json.write_text(
-        json.dumps(
-            {
-                "schema": SCHEMA,
-                "totals": totals,
-                "premium_requests": spend,
-                "unreadable": unreadable,
-                "results": results,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
 
 
 def write_check(args: argparse.Namespace) -> None:
@@ -344,7 +292,8 @@ def write_check(args: argparse.Namespace) -> None:
     )
     if args.summary:
         args.summary.write_text(model.check_summary(check), encoding="utf-8")
-    print(f"verdict: {check.verdict}; {'; '.join(check.reasons)}")
+    reasons = policy.log_safe("; ".join(check.reasons))[:500]
+    print(f"verdict: {check.verdict}; {reasons}")
 
 
 def write_apply(args: argparse.Namespace) -> None:
@@ -384,13 +333,13 @@ def build_parser() -> argparse.ArgumentParser:
     comment = commands.add_parser("comment", help="comment the outcome on the issue")
     comment.add_argument("--result", type=Path, required=True)
     comment.add_argument("--run-url", default="")
-    comment.set_defaults(handler=run_comment)
+    comment.set_defaults(handler=comments.run_comment)
 
     report = commands.add_parser("report", help="merge results into a table")
     report.add_argument("--results", type=Path, required=True)
     report.add_argument("--output-md", type=Path, required=True)
     report.add_argument("--output-json", type=Path, required=True)
-    report.set_defaults(handler=run_report)
+    report.set_defaults(handler=reporting.run_report)
     return parser
 
 

@@ -59,6 +59,8 @@ jobs:
       org: my-org
       mode: pull-requests
       dry_run: false
+      # Trusted jobs default to block mode; name the allow-list.
+      egress_allow_config: '@<allow-list commit sha>'
       github_app_client_id: ${{ vars.CODE_MONKEY_CLIENT_ID }}
     secrets:
       copilot_token: ${{ secrets.COPILOT_CLI_TOKEN }}

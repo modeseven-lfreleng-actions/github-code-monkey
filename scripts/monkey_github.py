@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from typing import Any, cast
 
 API_VERSION = "2026-03-10"
@@ -21,6 +22,9 @@ API_VERSION = "2026-03-10"
 STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
 ABSENT = frozenset({404, 410})
 TIMEOUT_SECONDS = 60
+TRANSIENT = frozenset({500, 502, 503, 504})
+READ_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 2
 
 
 class GitHubError(Exception):
@@ -38,10 +42,20 @@ class GitHubError(Exception):
         self.status: int | None = int(found.group(1)) if found else None
 
 
-def run_gh(args: list[str], *, input: str | None = None) -> str:
-    """Run gh with a pinned REST API version, returning stdout or raising."""
-    if args[:1] == ["api"] and args[1:2] != ["graphql"]:
-        args = [*args, "--header", f"X-GitHub-Api-Version: {API_VERSION}"]
+def is_read(args: list[str]) -> bool:
+    """Whether a gh invocation only reads, and so is safe to repeat.
+
+    GraphQL goes through one endpoint for queries and mutations alike,
+    and ``createCommitOnBranch`` must never run twice, so no GraphQL
+    call counts as a read here.
+    """
+    if args[:1] == ["api"]:
+        return args[1:2] != ["graphql"] and "--method" not in args
+    return args[:2] in (["pr", "list"], ["repo", "list"], ["search", "issues"])
+
+
+def run_once(args: list[str], input: str | None) -> str:
+    """One gh invocation, raising GitHubError on any failure."""
     try:
         proc = subprocess.run(
             ["gh", *args],
@@ -58,6 +72,27 @@ def run_gh(args: list[str], *, input: str | None = None) -> str:
     if proc.returncode != 0:
         raise GitHubError(proc.stderr.strip() or f"gh {' '.join(args)} failed")
     return proc.stdout
+
+
+def run_gh(args: list[str], *, input: str | None = None) -> str:
+    """Run gh with a pinned REST API version, returning stdout or raising.
+
+    Reads retry a transient 5xx or timeout with a short backoff: the
+    selection makes hundreds of reads, and one 502 should not cost the
+    day's run. Writes run once; a repeated write is not harmless.
+    """
+    if args[:1] == ["api"] and args[1:2] != ["graphql"]:
+        args = [*args, "--header", f"X-GitHub-Api-Version: {API_VERSION}"]
+    attempts = READ_ATTEMPTS if is_read(args) else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_once(args, input)
+        except GitHubError as exc:
+            transient = exc.status in TRANSIENT or "timed out" in str(exc)
+            if attempt == attempts or not transient:
+                raise
+            time.sleep(RETRY_DELAY_SECONDS * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def decode_response(raw: str) -> Any:

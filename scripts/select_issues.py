@@ -36,6 +36,14 @@ REPO_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 PRIORITY_RANK = {"Urgent": 0, "High": 1, "Medium": 2, "Low": 3}
 SKIP_LABELS = frozenset({"question", "breaking-change", "chore", "no-agent"})
 BRANCH_PREFIX = "code-monkey/issue-"
+# GitHub expands at most 256 jobs from one matrix; a larger selection
+# would fail at the author job rather than run.
+MATRIX_LIMIT = 256
+# The verifier refuses a selection.json over 16 MiB. Issue bodies and
+# comments are bounded per issue, but 256 of them could still exceed
+# that, so the cumulative serialised size stops the selection first,
+# with headroom for the header fields and indentation.
+MAX_SELECTION_BYTES = 12 * 1024 * 1024
 
 
 def parse_repositories(text: str) -> list[str]:
@@ -121,10 +129,11 @@ def cheap_filter(
             or meta["archived"]
             or meta["template"]
             or meta["fork"]
+            or not meta["public"]
         ):
             skipped["repository"] += 1
             continue
-        if meta is None or not meta.get("default_branch"):
+        if meta is None or not meta.get("default_branch") or not meta["public"]:
             skipped["repository"] += 1
             continue
         labels = reads.label_names(issue.get("labels"))
@@ -171,12 +180,14 @@ def choose(
     """Keep one issue per repository, run the expensive checks, and cap."""
     seen: set[str] = set()
     chosen: list[dict[str, Any]] = []
+    cap = min(max_issues, MATRIX_LIMIT) if max_issues else MATRIX_LIMIT
+    used_bytes = 0
     for candidate in ranked:
         repo = str(candidate["repository"])
         if repo in seen:
             skipped["one_per_repo"] += 1
             continue
-        if max_issues and len(chosen) >= max_issues:
+        if len(chosen) >= cap or used_bytes >= MAX_SELECTION_BYTES:
             skipped["cap"] += 1
             continue
         number = int(candidate["number"])
@@ -187,18 +198,22 @@ def choose(
         if reads.has_open_linked_pr(repo, number):
             skipped["linked_pr"] += 1
             continue
-        seen.add(repo)
         comments, dropped = reads.filtered_comments(repo, number)
-        chosen.append(
-            {
-                "key": f"{candidate['repo_name']}-{number}",
-                **{k: v for k, v in candidate.items() if k != "assignees"},
-                "base_sha": reads.branch_head(repo, str(candidate["default_branch"])),
-                "branch": branch,
-                "comments": comments,
-                "comments_dropped": dropped,
-            }
-        )
+        entry: dict[str, Any] = {
+            "key": f"{candidate['repo_name']}-{number}",
+            **{k: v for k, v in candidate.items() if k != "assignees"},
+            "base_sha": reads.branch_head(repo, str(candidate["default_branch"])),
+            "branch": branch,
+            "comments": comments,
+            "comments_dropped": dropped,
+        }
+        size = len(json.dumps(entry, indent=2).encode("utf-8"))
+        if used_bytes + size > MAX_SELECTION_BYTES:
+            skipped["cap"] += 1
+            continue
+        used_bytes += size
+        seen.add(repo)
+        chosen.append(entry)
     return chosen
 
 
@@ -303,6 +318,7 @@ def write_outputs(directory: Path, selection: dict[str, Any], guidance: bytes) -
         {
             "key": issue["key"],
             "repository": issue["repository"],
+            "repo_name": issue["repo_name"],
             "number": issue["number"],
             "base_sha": issue["base_sha"],
             "branch": issue["branch"],

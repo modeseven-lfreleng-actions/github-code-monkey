@@ -16,11 +16,19 @@ from dataclasses import dataclass
 from typing import Any
 
 MAX_COMMITS = 5
+# createCommitOnBranch accepts at most 100 file changes per call.
+MAX_FILES_PER_COMMIT = 100
 MAX_ADDED_BYTES = 4 * 1024 * 1024
 MAX_BINARY_BYTES = 512 * 1024
 DEFAULT_TITLE_LIMIT = 50
 BODY_LINE_LIMIT = 72
 MAX_PR_TITLE = 256
+# GitHub rejects pull request bodies over 65,536 characters.
+MAX_PR_BODY = 65_536
+# An agent's abstention or failure reason as recorded and as it may
+# appear in an issue comment; the manifest itself may be up to 1 MiB.
+MAX_REASON = 2_000
+MAX_COMMENT_REASON = 4_000
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 KEY_RE = re.compile(r"[A-Za-z0-9_.-]+")
 COMMIT_TYPES = (
@@ -41,8 +49,10 @@ HEADLINE_RE = re.compile(
 )
 TRAILER_RE = re.compile(r"^[A-Za-z][A-Za-z-]*: .+$")
 URL_RE = re.compile(r"https?://")
+# Same-line whitespace alone: GitHub needs the keyword and reference on
+# one line, and four spaces of indentation make the line code.
 CLOSES_TEMPLATE = (
-    r"(?im)^\s*(?:closes|fixes|resolves)\s+(?:[\w.-]+/[\w.-]+)?#{number}\b"
+    r"(?im)^[ ]{{0,3}}(?:closes|fixes|resolves)[ \t]+(?:{repository})?#{number}\b"
 )
 PROTECTED_PATHS = ("AGENTS.md", "REUSE.toml", ".gitlint")
 PROTECTED_PREFIXES = ("LICENSE", "LICENSES/")
@@ -52,7 +62,7 @@ MODE_EXECUTABLE = "100755"
 MODE_SYMLINK = "120000"
 MODE_SUBMODULE = "160000"
 LABEL = "code-monkey"
-VERDICTS = ("proposed", "abstain", "rejected", "author-failed")
+VERDICTS = ("proposed", "abstain", "rejected", "author-failed", "publish-failed")
 MANIFEST_OUTCOMES = ("proposed", "abstain", "author-failed")
 
 
@@ -129,10 +139,17 @@ def check_change_mode(path: str, status: str, old_mode: str, new_mode: str) -> N
 
 
 def split_message(message: str) -> tuple[str, list[str], list[str]]:
-    """Return headline, body lines and the trailer block."""
+    """Return headline, body lines and the trailer block.
+
+    The line after the subject must be blank before anything else is
+    interpreted, so a trailer glued to the subject is a rejection
+    rather than a trailer.
+    """
     lines = message.rstrip("\n").split("\n")
     headline = lines[0].rstrip()
     rest = lines[1:]
+    if rest and rest[0].strip():
+        raise Rejection("commit message lacks a blank line after the subject")
     while rest and not rest[-1].strip():
         rest.pop()
     trailers: list[str] = []
@@ -141,8 +158,6 @@ def split_message(message: str) -> tuple[str, list[str], list[str]]:
         trailers.insert(0, body.pop())
     while body and not body[-1].strip():
         body.pop()
-    if body and body[0].strip():
-        raise Rejection("commit message lacks a blank line after the subject")
     while body and not body[0].strip():
         body.pop(0)
     return headline, body, trailers
@@ -167,6 +182,26 @@ def check_body(body: list[str]) -> None:
             raise Rejection(f"body line exceeds {BODY_LINE_LIMIT} characters: {line!r}")
 
 
+def comment_safe(text: str) -> str:
+    """Flatten untrusted text for a one-line issue comment.
+
+    Newlines would let agent output add rendered blocks, and an
+    @-mention would notify whoever it names; a zero-width space after
+    each @ keeps the text readable without the ping.
+    """
+    return " ".join(text.split()).replace("@", "@\u200b")
+
+
+def log_safe(text: str) -> str:
+    """Make untrusted text safe to print from a job whose log GitHub parses.
+
+    A newline followed by ``::error::`` or ``::stop-commands::`` would
+    let agent output spoof annotations or alter log-command parsing.
+    """
+    flat = " ".join(text.split())
+    return flat.replace("::", ": :").replace("##[", "# #[")
+
+
 def coauthor_for(model: str, mapping: dict[str, Any]) -> str:
     """Map a model identifier prefix to its trailer identity."""
     for prefix, trailer in mapping.items():
@@ -175,11 +210,21 @@ def coauthor_for(model: str, mapping: dict[str, Any]) -> str:
     raise PublishError(f"no co-author mapping for model {model!r}")
 
 
+def trailer_address(line: str) -> str | None:
+    """The bracketed address of a trailer line, lower-cased, if it has one."""
+    found = re.search(r"<([^<>]+)>\s*$", line)
+    return found.group(1).strip().lower() if found else None
+
+
 def compose_trailers(trailers: list[str], identity: Identity) -> list[str]:
     """Ensure the model's co-author and the bot's sign-off close the block."""
     kept = [line for line in trailers if line.strip() != identity.sign_off]
-    address = identity.coauthor.split("<")[-1].rstrip(">")
-    if not any(line.startswith("Co-authored-by:") and address in line for line in kept):
+    address = trailer_address(identity.coauthor)
+    present = any(
+        line.startswith("Co-authored-by:") and trailer_address(line) == address
+        for line in kept
+    )
+    if not present:
         kept.append(f"Co-authored-by: {identity.coauthor}")
     kept.append(identity.sign_off)
     return kept
@@ -196,10 +241,29 @@ def compose_message(message: str, identity: Identity, limit: int) -> tuple[str, 
     return headline, full_body
 
 
+FENCE_RE = re.compile(r"(?ms)^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$")
+CODE_SPAN_RE = re.compile(r"(`+)(?:(?!\1).)+?\1", re.S)
+
+
+def strip_code(markdown: str) -> str:
+    """Drop fenced blocks and code spans, where GitHub ignores closing keywords."""
+    return CODE_SPAN_RE.sub("", FENCE_RE.sub("", markdown))
+
+
 def check_pull_request_text(
-    title: Any, body: Any, *, issue: int, single_headline: str | None
+    title: Any,
+    body: Any,
+    *,
+    repository: str,
+    issue: int,
+    single_headline: str | None,
 ) -> tuple[str, str]:
-    """Check the title and body the agent proposed; return them stripped."""
+    """Check the title and body the agent proposed; return them stripped.
+
+    The closing reference must name this issue in this repository: a
+    bare ``#N`` or ``owner/repo#N`` for the selected repository alone,
+    so the merged pull request closes what the run set out to close.
+    """
     if not isinstance(title, str) or not title.strip():
         raise Rejection("manifest lacks a pull request title")
     if not isinstance(body, str) or not body.strip():
@@ -209,9 +273,18 @@ def check_pull_request_text(
         raise Rejection("single-commit pull request title must equal the subject")
     if len(title) > MAX_PR_TITLE:
         raise Rejection(f"pull request title exceeds {MAX_PR_TITLE} characters")
-    if not re.search(CLOSES_TEMPLATE.format(number=issue), body):
+    pattern = CLOSES_TEMPLATE.format(repository=re.escape(repository), number=issue)
+    if not re.search(pattern, strip_code(body)):
         raise Rejection(f"pull request body lacks a 'Closes #{issue}' line")
     return title, body.rstrip("\n")
+
+
+def check_pull_request_body_size(body: str) -> None:
+    """Refuse a composed body GitHub would reject, before any write happens."""
+    if len(body) > MAX_PR_BODY:
+        raise Rejection(
+            f"pull request body exceeds {MAX_PR_BODY} characters after provenance"
+        )
 
 
 def provenance_block(

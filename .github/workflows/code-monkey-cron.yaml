@@ -134,7 +134,10 @@ jobs:
       include_assigned: ${{ inputs.include_assigned || false }}
       load_repo_skills: ${{ inputs.load_repo_skills || false }}
       repositories: "${{ inputs.repositories || '' }}"
-      egress_policy: 'audit'
+      # Trusted jobs hold App tokens and run in block mode with the
+      # organisation allow-list; the author job is always audit.
+      egress_policy: 'block'
+      egress_allow_config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
       github_app_client_id: "${{ vars.LF_CODE_MONKEY_CLIENT_ID || '' }}"
       assets_repository: "${{ github.repository }}"
       assets_ref: "${{ github.sha }}"

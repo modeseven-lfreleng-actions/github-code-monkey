@@ -135,6 +135,25 @@ content the agent reads. A prompt-injected issue can waste model
 spend and produce a bad diff. It cannot push, cannot open a pull
 request, and cannot reach another repository.
 
+### 4.2 What the design trusts the caller with
+
+The calling workflow supplies both the App key and the
+`assets_repository`/`assets_ref` coordinate that the trusted jobs
+execute. The design trusts the caller with both: a caller able to
+point the assets at hostile code could as well edit its own workflow
+to run that code with the same key. Both callers here pin the assets
+to their own `github.sha`, and `issues-triage` makes the same
+assumption.
+
+The pull request plumbing job executes the pull request's own
+scripts with the native token alone. GitHub gives a fork's
+`pull_request` run a `GITHUB_TOKEN` without write scopes and no
+secrets, and
+here that token can read nothing beyond public issues and contents,
+expires with the job, and runs under block-mode egress. That is the
+sandbox GitHub intends for untrusted pull requests, and the job
+needs no stronger one.
+
 ## 5. Signed Commits Without a Key on the Runner
 
 The organisation enforces commit signatures: one unsigned commit
@@ -171,13 +190,26 @@ Consequences the implementation has to handle:
   the follow-up a human has to make (§7.3).
 - **Renames** become a deletion plus an addition. Git history shows
   the rename through similarity detection as usual.
-- **Sequencing.** The publisher creates the branch at the agent's
-  recorded base SHA, then replays commits in order, passing each
-  result as the next `expectedHeadOid`. A mismatch aborts that
-  repository's publication.
+- **Sequencing and rollback.** The publisher creates the branch at
+  the agent's recorded base SHA, then replays commits in order,
+  passing each result as the next `expectedHeadOid`. A failure from
+  branch creation onwards (a create that loses its reply, a mismatch,
+  a transient API error, a rejected pull request) deletes the branch
+  before the step fails, and a delete that finds no branch counts as
+  clean. A branch that already existed stays untouched: the run did
+  not create it and has no claim to remove it. If that branch carries
+  an open pull request from the target repository, a rerun of the
+  same publish job has met its own earlier success, and the result
+  reports that pull request without commenting again; otherwise the
+  existing branch is a rejection: a
+  half-built branch would otherwise count as a prior attempt (§6)
+  and keep the issue out of every later run. The result records
+  `publish-failed` with the reason and whether the branch came off.
 - **Payload size.** GitHub does not document the mutation's request
   limit. The publisher caps total added bytes at 4 MiB and rejects
   binaries over 512 KiB; the rollout (§15) confirms the cap holds.
+  The composed pull request body, provenance included, must fit
+  GitHub's 65,536-character limit, checked before any write.
 
 ## 6. Issue Selection
 
@@ -186,9 +218,11 @@ The select job holds an App token with `issues: read`,
 across the organisation. It builds a candidate list and writes
 `selection.json`.
 
-**Candidate.** An open issue (not a pull request) in a
-non-archived, non-template repository of the target owner, whose
-repository is not on the exclusion list and is not `.github` (unless
+**Candidate.** An open issue (not a pull request) in a **public**,
+non-archived, non-template, non-fork repository of the target owner
+(the author job clones without a credential, so private and
+internal repositories cannot take part), whose repository is not on
+the exclusion list and is not `.github` (unless
 `include_dotgithub`), and which:
 
 - has a Type (triage has run);
@@ -196,9 +230,10 @@ repository is not on the exclusion list and is not `.github` (unless
 - has no `no-agent` label (a human opt-out, per issue);
 - has no assignee, unless the caller sets `include_assigned`: an
   assignee means a human has claimed the work;
-- has no pull request, open or closed, that references it from a
-  `code-monkey/*` branch (the workflow already tried, or a human
-  declined the result);
+- has no pull request, open or closed, from a `code-monkey/*`
+  branch **in the target repository itself** (the workflow already
+  tried, or a human declined the result); a pull request from a fork
+  branch of the same name does not count, since anyone can open one;
 - has no other open pull request linked to close it.
 
 **Ranking.** Priority `Urgent`, then `High`, `Medium`, `Low`; issues
@@ -213,7 +248,18 @@ blast radius of a mistake. The rest of that repository's backlog
 waits for the next run.
 
 **Cap.** The first `max_issues` survivors form the selection. `0`
-lifts the cap; the Actions matrix limit of 256 jobs still applies.
+lifts the cap as far as the Actions matrix limit of 256 jobs, which
+the selector applies itself so a broad run degrades to a bounded
+selection instead of failing at matrix expansion. A second bound
+holds the serialised selection under 12 MiB, inside the 16 MiB the
+verifier accepts, since 256 entries at the per-issue body and
+comment caps would otherwise exceed it.
+
+**Guidance ref.** `guidance_ref` may name a branch, a tag or a
+commit. The selector resolves it to a commit, following an annotated
+tag, and refuses a ref whose target is anything but a commit, so the
+recorded provenance always names the commit whose `AGENTS.md` the
+agent read.
 
 **Explicit repositories.** When `repositories` names one or more
 repositories, the candidate scan covers those alone and skips the
@@ -363,9 +409,11 @@ target's `.pre-commit-config.yaml` pins. A block-mode allow-list
 that covers every repository's toolchain is a maintenance load this
 design defers; the audit log records what each session reached.
 
-The select and publish jobs run in `block` mode with the
-organisation's allow-list from `harden-runner-block-action`, with
-`allow_list_summary: 'true'` on the select job alone.
+The select, publish and report jobs run in `block` mode with the
+organisation's allow-list from `harden-runner-block-action`, pinned
+by commit in both callers, with `allow_list_summary: 'true'` on the
+select job alone. `block` is the reusable workflow's default; a
+caller may pass `audit` to diagnose a blocked endpoint.
 
 ## 8. The Publish Job
 
@@ -388,7 +436,9 @@ For each selected issue:
    comes by the select job's artifact **ID** and must match its
    digest before anything else happens; `monkey_evidence.py accept`
    then copies the bounded manifest, bundle and usage files and
-   nothing else out of the untrusted download.
+   nothing else out of the untrusted download. An artifact that
+   fails that acceptance records `author-failed` the same way, so
+   every issue reaches a result, a comment and a report row.
 2. **Verify the bundle.** `git bundle verify` against a fresh
    credential-less fetch of the target at the recorded base SHA. The
    bundle's prerequisite must equal that SHA, the history must be
@@ -397,7 +447,10 @@ For each selected issue:
    Outcome `abstain` or `author-failed` records and moves on.
 3. **Policy-check the diff** across all commits: no executable
    files, symlinks, submodules or mode changes (§5); no path escaping
-   the tree; total added bytes under the cap; no change to
+   the tree and every path valid UTF-8, since the API takes text and
+   the check would otherwise see one name while the API creates
+   another; at least one and at most 100 file changes per commit,
+   the mutation's requirements; total added bytes under the cap; no change to
    `AGENTS.md`, `LICENSE*`, `REUSE.toml` or `.gitlint`. Changes
    under `.github/workflows/` pass and flag the token mint in step 5.
 4. **Check the message** of each commit against the rules the org
@@ -405,8 +458,8 @@ For each selected issue:
    `.gitlint` (fallback 50), capitalised type from the allowed list,
    no trailing punctuation, blank line after the subject, body lines
    ≤ 72 outside URL lines. Compose the trailers (§5).
-5. **Mint a token** for that repository alone
-   (`repositories: <name>`) with `contents: write`,
+5. **Mint a token** for that repository alone (`repositories:` the
+   bare `repo_name`, relative to `owner`) with `contents: write`,
    `pull_requests: write` (read in `branches` mode), `metadata:
    read`, plus `workflows: write` when step 3 saw a workflow change.
    Dry-run and `select` mode never reach this step.
@@ -422,7 +475,10 @@ For each selected issue:
 8. **Comment on the issue** with one line: the pull request URL on
    success; on `abstain`, the agent's reason; on a policy or
    provenance rejection, which check failed and the run URL. The
-   comment uses a second per-repository token carrying
+   reason descends from the untrusted manifest; the publisher cuts
+   it to 2,000 characters when recording and again when rendering,
+   which keeps the comment inside GitHub's limit with the run URL
+   intact. The comment uses a second per-repository token carrying
    `issues: write` and nothing else, minted for this step alone.
    GitHub has no permission that stops at comments: `issues: write`
    also covers labels, assignees, milestones, close and reopen. The
@@ -455,7 +511,7 @@ For each selected issue:
 | `exclude_repos` | string | `''` | Overrides bundled list |
 | `guidance_repository` | string | `<org>/.github` | Holds the org `AGENTS.md` |
 | `guidance_ref` | string | `main` | Branch or tag recorded and used |
-| `egress_policy` | string | `audit` | Author job is always `audit` |
+| `egress_policy` | string | `block` | Trusted jobs; author is always `audit` |
 | `egress_allow_config` | string | `''` | Allow-list action coordinate |
 | `github_app_client_id` | string | `''` | Empty limits runs to dry-run |
 | `assets_repository` | string | this repo | Prompt and scripts |
@@ -530,7 +586,9 @@ subject to its final configuration:
 | Pull requests | write | publish | Open PR, label |
 | Workflows | write | publish | Commits that touch `.github/workflows/` |
 
-The select job mints an org-wide token with the read levels alone;
+The select job mints a token with the read levels alone, org-wide by
+default and scoped to the named repositories plus the guidance
+repository when the caller lists any;
 `issues: write` on the App is a ceiling, and each mint requests the
 lower level it needs. The publish job mints one token per
 repository for the write steps and a separate one for the comment.
@@ -653,7 +711,9 @@ scripts/monkey_evidence.py               bounded verified copies
 scripts/proposal_policy.py               the rules a proposal must pass
 scripts/proposal_check.py                offline bundle verification
 scripts/proposal_model.py                verdict record and its rendering
-scripts/publish.py                       replay, open PR, comment, report
+scripts/publish.py                       replay, open PR, reconcile
+scripts/issue_comment.py                 one-line outcome comment
+scripts/proposal_report.py               merge results into the report
 tests/                                   unittest suite, offline
 pyproject.toml, uv.lock                  Python tooling
 docs/DESIGN.md                           this document
@@ -799,8 +859,8 @@ cross-checked against the trusted `selection.json`.
 
 `key` is `<repo_name>-<number>` and doubles as the matrix key and
 the artifact-name suffix. Beside it the select job writes
-`matrix.json` (`{"include": [{key, repository, number, base_sha,
-branch}]}`), `agents.md` (the guidance bytes whose SHA-256 the
+`matrix.json` (`{"include": [{key, repository, repo_name, number,
+base_sha, branch}]}`), `agents.md` (the guidance bytes whose SHA-256 the
 `guidance` block records) and `excluded-repos.txt`. The job outputs
 `selection_sha256` and `guidance_sha256` over the exact bytes.
 
@@ -863,7 +923,9 @@ The output of `publish.py check`, produced without credentials.
 }
 ```
 
-`verdict` is `proposed`, `abstain`, `rejected` or `author-failed`.
+`verdict` is `proposed`, `abstain`, `rejected` or `author-failed`
+here; `result.json` (§18.4) adds `publish-failed` for a write that
+failed after verification, with the branch rolled back.
 `reasons` explains anything but `proposed`. `commits[].body` is the
 composed message the publisher will send: the agent's body plus the
 trailers §5 describes. `pr_body` carries the appended provenance

@@ -204,6 +204,25 @@ class TopLevelContracts(ReusableWorkflowCase):
                 with self.subTest(job=job):
                     self.assertEqual(value, "false")
 
+    def test_every_trusted_job_loads_the_allow_list(self) -> None:
+        """Select, publish and report load the allow-list before hardening.
+
+        CONNECTION_ALLOW_LIST does not cross job boundaries, and
+        harden-runner in block mode with an empty list enforces nothing.
+        """
+        for job in ("select", "publish", "report"):
+            with self.subTest(job=job):
+                loaders = self.actions(job, BLOCK_ACTION)
+                self.assertEqual(len(loaders), 1)
+                self.assert_expression(
+                    loaders[0]["with"]["config"], "inputs.egress_allow_config"
+                )
+                harden = self.action(job, HARDEN_RUNNER)
+                self.assert_expression(
+                    harden["with"]["allowed-endpoints"], "env.CONNECTION_ALLOW_LIST"
+                )
+        self.assertEqual(self.actions("author", BLOCK_ACTION), [])
+
 
 class AuthorJobContracts(ReusableWorkflowCase):
     """The untrusted job: no App key, audit egress, evidence before checkout."""
@@ -417,7 +436,12 @@ class PublishJobContracts(ReusableWorkflowCase):
         accept = self.step("publish", "Accept bounded proposal files")
         self.assert_expression(accept["env"]["FETCHED"], "steps.fetch.outcome")
         script = flatten(accept["run"])
-        self.assertIn('if [ "$FETCHED" = success ]', script)
+        self.assertIn('if [ "$FETCHED" != success ]', script)
+        # A failed acceptance falls through to the typed manifest too.
+        self.assertIn(
+            "elif ! python3 monkey-assets/scripts/monkey_evidence.py accept", script
+        )
+        self.assertIn("the proposal artifact failed bounded acceptance", script)
         self.assertIn("monkey_evidence.py accept", script)
         self.assertIn('"author-failed"', script)
 
@@ -436,7 +460,7 @@ class PublishJobContracts(ReusableWorkflowCase):
         self.assertIn("steps.check.outputs.verdict == 'proposed'", condition)
         self.assertIn("inputs.github_app_client_id != ''", condition)
         with_ = cast(dict[str, Any], write["with"])
-        self.assert_expression(with_["repositories"], "matrix.repository")
+        self.assert_expression(with_["repositories"], "matrix.repo_name")
         self.assertEqual(with_["permission-contents"], "write")
         self.assert_expression(
             with_["permission-pull-requests"],
@@ -449,10 +473,15 @@ class PublishJobContracts(ReusableWorkflowCase):
 
         comment = self.step("publish", "comment-token")
         self.assertTrue(is_action(comment, APP_TOKEN))
-        self.assertIn("!inputs.dry_run", unwrap(str(comment["if"])))
+        condition = unwrap(str(comment["if"]))
+        self.assertIn("!inputs.dry_run", condition)
+        # The comment must also reach the issue after a failed apply, so
+        # the rollback is visible; never after cancellation.
+        self.assertIn("!cancelled()", condition)
+        self.assertIn("steps.apply.outcome != 'skipped'", condition)
         comment_with = cast(dict[str, Any], comment["with"])
         self.assertEqual(comment_with["permission-issues"], "write")
-        self.assert_expression(comment_with["repositories"], "matrix.repository")
+        self.assert_expression(comment_with["repositories"], "matrix.repo_name")
 
     def test_writes_never_fall_back_to_the_native_token(self) -> None:
         """Branch, pull request and comment writes use App tokens alone."""
@@ -527,6 +556,19 @@ class SelectAndReportContracts(ReusableWorkflowCase):
         env = cast(dict[str, Any], mint["env"])
         self.assertEqual(env["INPUT_PERMISSION-ISSUE-FIELDS"], "read")
         self.assertEqual(env["INPUT_PERMISSION-ISSUE-TYPES"], "read")
+        # A scoped list must still reach the guidance repository, or a
+        # targeted run cannot read AGENTS.md with its own token.
+        budget = squash(str(self.step("select", "budget")["run"]))
+        self.assertIn('guidance_name="${GUIDANCE_REPOSITORY#*/}"', budget)
+        self.assertIn('repositories="$repositories,$guidance_name"', budget)
+        self.assertIn("sed '/^$/d'", budget)
+
+    def test_manifest_outcome_is_printed_by_known_value(self) -> None:
+        """The author job prints a recognised outcome, never raw manifest text."""
+        script = squash(str(self.step("author", "Bundle proposed commits")["run"]))
+        self.assertIn("*) outcome=unrecognised ;;", script)
+        self.assertIn('echo "Manifest outcome: $outcome"', script)
+        self.assertNotIn('echo "Manifest outcome: $(jq', script)
 
     def test_evidence_upload_is_mandatory_and_short_lived(self) -> None:
         """Evidence must exist and lives seven days, per the retention table."""
@@ -689,6 +731,10 @@ class CronCallerContracts(WorkflowCase):
             "vars.LF_CODE_MONKEY_CLIENT_ID", unwrap(str(with_["github_app_client_id"]))
         )
         self.assert_expression(with_["assets_ref"], "github.sha")
+        # Trusted jobs hold App tokens: block mode with the pinned
+        # organisation allow-list, never audit, on the live caller.
+        self.assertEqual(with_["egress_policy"], "block")
+        self.assertRegex(str(with_["egress_allow_config"]), r"^@[0-9a-f]{40}$")
         secrets = cast(dict[str, Any], job["secrets"])
         self.assertEqual(set(secrets), {"copilot_token", "github_app_private_key"})
         self.assert_expression(secrets["copilot_token"], "secrets.COPILOT_CLI_TOKEN")

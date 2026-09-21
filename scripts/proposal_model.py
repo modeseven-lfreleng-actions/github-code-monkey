@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+import proposal_policy as policy
 from proposal_policy import Identity, PublishError
 
 SCHEMA = 1
@@ -99,12 +101,31 @@ def read_usage(path: Path, check: Check) -> None:
     except PublishError as exc:
         check.reasons.append(f"usage.json unreadable: {exc}")
         return
-    cost = usage.get("totalPremiumRequestCost")
-    if isinstance(cost, (int, float)):
+    cost = usage_number(usage.get("totalPremiumRequestCost"))
+    if cost is not None:
         check.premium_requests = int(round(cost))
-    duration = usage.get("totalApiDurationMs")
-    if isinstance(duration, (int, float)):
+    duration = usage_number(usage.get("totalApiDurationMs"))
+    if duration is not None:
         check.agent_seconds = int(duration // 1000)
+
+
+def usage_number(value: Any) -> float | None:
+    """A finite, non-negative number from untrusted JSON, or None.
+
+    Booleans are ints in Python and 1e309 parses to infinity; neither
+    is a spend figure, and either would corrupt a total or make
+    ``round`` raise inside the publisher.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        # A JSON integer with hundreds of digits does not fit a float.
+        return None
+    if not math.isfinite(number) or number < 0 or number > 1e12:
+        return None
+    return number
 
 
 @dataclass(frozen=True)
@@ -123,7 +144,7 @@ def check_summary(check: Check) -> str:
     """Markdown for the step summary."""
     lines = [f"### {check.repository}#{check.issue} — `{check.verdict}`", ""]
     for reason in check.reasons:
-        lines.append(f"- {reason}")
+        lines.append(f"- {policy.log_safe(reason)}")
     if check.commits:
         lines += ["", "| Commit | Files | Bytes |", "| --- | --- | --- |"]
         for commit in check.commits:

@@ -33,6 +33,7 @@ def repo_meta(name: str, **overrides: Any) -> dict[str, Any]:
         "archived": False,
         "template": False,
         "fork": False,
+        "public": True,
         "default_branch": "main",
     }
     meta.update(overrides)
@@ -240,6 +241,7 @@ class CheapFilterTest(unittest.TestCase):
             "archived": repo_meta("archived", archived=True),
             "template": repo_meta("template", template=True),
             "fork": repo_meta("fork", fork=True),
+            "private": repo_meta("private", public=False),
             "headless": repo_meta("headless", default_branch=None),
         }
 
@@ -271,7 +273,7 @@ class CheapFilterTest(unittest.TestCase):
         self.assertEqual(sum(skipped.values()), 1)
 
     def test_repository_rules(self) -> None:
-        """Dot-github, archived, template, fork, unknown and excluded are skipped."""
+        """Dot-github, archived, template, fork, private, unknown, excluded skip."""
         issues = [
             search_issue(".github", 1),
             search_issue("archived", 2),
@@ -281,10 +283,11 @@ class CheapFilterTest(unittest.TestCase):
             search_issue("beta", 6),
             search_issue("headless", 7),
             search_issue("alpha", 8),
+            search_issue("private", 9),
         ]
         kept, skipped = self.run_filter(issues, exclusions={"beta"})
         self.assertEqual([c["number"] for c in kept], [8])
-        self.assertEqual(skipped["repository"], 7)
+        self.assertEqual(skipped["repository"], 8)
         self.assertEqual(kept[0]["repository"], "org/alpha")
         self.assertEqual(kept[0]["repo_name"], "alpha")
         self.assertEqual(kept[0]["default_branch"], "main")
@@ -444,6 +447,30 @@ class ChooseTest(NoSubprocessCase):
         self.assertEqual(len(chosen), 5)
         self.assertEqual(skipped["cap"], 0)
 
+    def test_matrix_limit_bounds_even_unbounded_runs(self) -> None:
+        """Zero and oversized caps both stop at the Actions matrix limit."""
+        ranked = [candidate(f"r{i}", i) for i in range(1, select.MATRIX_LIMIT + 4)]
+        for requested in (0, select.MATRIX_LIMIT + 50):
+            with self.subTest(max_issues=requested):
+                skipped = fresh_skipped()
+                chosen = select.choose(ranked, max_issues=requested, skipped=skipped)
+                self.assertEqual(len(chosen), select.MATRIX_LIMIT)
+                self.assertEqual(skipped["cap"], 3)
+
+    def test_selection_byte_budget(self) -> None:
+        """The cumulative serialised size stops selection under the verifier cap."""
+        big = candidate("big", 1)
+        big["body"] = "x" * 1000
+        small = candidate("small", 2)
+        ranked = [big, small, candidate("third", 3)]
+        skipped = fresh_skipped()
+        with patch.object(select, "MAX_SELECTION_BYTES", 1500):
+            chosen = select.choose(ranked, max_issues=0, skipped=skipped)
+        # The first entry fits alone; the second would push past the budget
+        # and the third is refused without further reads.
+        self.assertEqual([c["number"] for c in chosen], [1])
+        self.assertEqual(skipped["cap"], 2)
+
     def test_prior_attempt_and_linked_pr(self) -> None:
         """A prior bot branch or an open linked PR skips the issue."""
         self.prior.side_effect = attempted_issue_one
@@ -514,6 +541,7 @@ class WriteOutputsTest(unittest.TestCase):
                         {
                             "key": "alpha-3",
                             "repository": "org/alpha",
+                            "repo_name": "alpha",
                             "number": 3,
                             "base_sha": SHA_A,
                             "branch": "code-monkey/issue-3",

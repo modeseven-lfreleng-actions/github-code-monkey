@@ -92,16 +92,21 @@ def selection_identity(
 
 def read_manifest(path: Path, check: Check) -> dict[str, Any]:
     """Read the untrusted manifest and cross-check it against the selection."""
-    manifest = load_json(path, "manifest")
+    try:
+        manifest = load_json(path, "manifest")
+    except PublishError as exc:
+        # Agent output; malformed is a verdict, not an operational fault.
+        raise Rejection(str(exc)) from exc
     outcome = manifest.get("outcome")
     if outcome not in policy.MANIFEST_OUTCOMES:
         raise Rejection(f"manifest outcome {outcome!r} is not recognised")
     if outcome != "proposed":
         reason = manifest.get("reason")
         check.verdict = str(outcome)
-        check.reasons.append(
-            reason if isinstance(reason, str) and reason else "no reason given"
+        text = (
+            reason if isinstance(reason, str) and reason.strip() else "no reason given"
         )
+        check.reasons.append(text[: policy.MAX_REASON])
         return manifest
     expected = {
         "repository": check.repository,
@@ -227,13 +232,16 @@ def walk_diff(clone: Path, parent: str, sha: str, check: Check) -> dict[str, Any
     deletions: list[str] = []
     index = 0
     while index < len(fields) and fields[index]:
-        meta = fields[index].decode("utf-8", "replace")
-        path = (
-            fields[index + 1].decode("utf-8", "replace")
-            if index + 1 < len(fields)
-            else ""
-        )
+        meta = fields[index].decode("ascii", "replace")
+        raw_path = fields[index + 1] if index + 1 < len(fields) else b""
         index += 2
+        try:
+            # Git allows any bytes in a path; the API takes UTF-8 text.
+            # A path that does not round-trip would be checked under
+            # one name and created under another, so refuse it.
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise Rejection(f"path {raw_path!r} is not valid UTF-8") from exc
         parts = meta.lstrip(":").split()
         if len(parts) != 5:
             raise PublishError(f"unexpected diff-tree entry {meta!r}")
@@ -242,6 +250,10 @@ def walk_diff(clone: Path, parent: str, sha: str, check: Check) -> dict[str, Any
             raise Rejection(f"unsafe path {path!r}")
         if policy.protected(path):
             raise Rejection(f"{path} is protected and cannot change")
+        if path.startswith(policy.WORKFLOW_PREFIX):
+            # Deleting a workflow file needs the grant as much as
+            # writing one; flag before the deletion branch returns.
+            check.needs_workflows = True
         if status.startswith("D"):
             deletions.append(path)
             continue
@@ -254,10 +266,16 @@ def walk_diff(clone: Path, parent: str, sha: str, check: Check) -> dict[str, Any
         check.added_bytes += size
         if check.added_bytes > policy.MAX_ADDED_BYTES:
             raise Rejection(f"total added bytes exceed {policy.MAX_ADDED_BYTES}")
-        if path.startswith(policy.WORKFLOW_PREFIX):
-            check.needs_workflows = True
         additions.append({"path": path, "blob": new_blob, "size": size})
-    check.files_changed += len(additions) + len(deletions)
+    changed = len(additions) + len(deletions)
+    if changed == 0:
+        raise Rejection(f"{sha[:7]} changes no files; the API cannot replay it")
+    if changed > policy.MAX_FILES_PER_COMMIT:
+        raise Rejection(
+            f"{sha[:7]} changes {changed} files; the API replays at most "
+            f"{policy.MAX_FILES_PER_COMMIT} per commit"
+        )
+    check.files_changed += changed
     return {"additions": additions, "deletions": deletions}
 
 
@@ -280,6 +298,7 @@ def verify_proposal(check: Check, manifest: dict[str, Any], context: Context) ->
     title, body = policy.check_pull_request_text(
         manifest.get("pr_title"),
         manifest.get("pr_body"),
+        repository=check.repository,
         issue=check.issue,
         single_headline=single,
     )
@@ -292,6 +311,7 @@ def verify_proposal(check: Check, manifest: dict[str, Any], context: Context) ->
         commands=check.commands,
     )
     check.pr_body = body + "\n" + provenance
+    policy.check_pull_request_body_size(check.pr_body)
 
 
 def run_check(

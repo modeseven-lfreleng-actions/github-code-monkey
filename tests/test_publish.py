@@ -23,6 +23,8 @@ github = import_module("monkey_github")
 checks = import_module("proposal_check")
 policy = import_module("proposal_policy")
 publish = import_module("publish")
+comments = import_module("issue_comment")
+reporting = import_module("proposal_report")
 
 BASE = "a" * 40
 BLOB_ONE = "1" * 40
@@ -136,7 +138,7 @@ class CommentBodyTest(unittest.TestCase):
 
     def test_proposed_pull_request(self) -> None:
         """A pull request URL names the pull request."""
-        body = publish.comment_body(result_json(), "https://run")
+        body = comments.comment_body(result_json(), "https://run")
         self.assertEqual(
             body,
             "🐒 An AI agent has proposed a change for this issue: pull request "
@@ -145,20 +147,20 @@ class CommentBodyTest(unittest.TestCase):
 
     def test_proposed_branch_only(self) -> None:
         """Without a pull request the branch URL is named."""
-        body = publish.comment_body(result_json(pull_request_url=None), "")
+        body = comments.comment_body(result_json(pull_request_url=None), "")
         self.assertIsNotNone(body)
         self.assertIn("branch https://github.com/owner/repo/tree/", body or "")
 
     def test_proposed_without_url(self) -> None:
         """A proposed result with no URL (dry run) says nothing."""
         result = result_json(pull_request_url=None, branch_url=None)
-        self.assertIsNone(publish.comment_body(result, ""))
+        self.assertIsNone(comments.comment_body(result, ""))
 
     def test_abstain(self) -> None:
         """Abstain quotes the joined reasons."""
         result = result_json(verdict="abstain", reasons=["too big", "unclear"])
         self.assertEqual(
-            publish.comment_body(result, ""),
+            comments.comment_body(result, ""),
             "🐒 An AI agent looked at this issue and did not attempt it: too big; unclear",
         )
 
@@ -166,7 +168,7 @@ class CommentBodyTest(unittest.TestCase):
         """Rejected names the check and the run."""
         result = result_json(verdict="rejected", reasons=["symlink"])
         self.assertEqual(
-            publish.comment_body(result, "https://run"),
+            comments.comment_body(result, "https://run"),
             "🐒 An AI agent attempted this issue but its proposal failed a policy "
             "check (symlink). Run: https://run",
         )
@@ -175,13 +177,45 @@ class CommentBodyTest(unittest.TestCase):
         """author-failed says it did not finish; missing run URL is n/a."""
         result = result_json(verdict="author-failed", reasons=["timeout"])
         self.assertEqual(
-            publish.comment_body(result, ""),
+            comments.comment_body(result, ""),
             "🐒 An AI agent attempted this issue but did not finish (timeout). Run: n/a",
         )
 
     def test_unknown_verdict(self) -> None:
         """An unknown verdict yields no comment."""
-        self.assertIsNone(publish.comment_body(result_json(verdict="weird"), ""))
+        self.assertIsNone(comments.comment_body(result_json(verdict="weird"), ""))
+
+    def test_long_reasons_are_bounded_and_keep_the_run_url(self) -> None:
+        """An oversized manifest reason cannot push the comment past GitHub's limit."""
+        text = comments.comment_body(
+            {"verdict": "abstain", "reasons": ["x" * 70_000]}, "https://run"
+        )
+        self.assertIsNotNone(text)
+        self.assertLess(len(text or ""), policy.MAX_PR_BODY)
+        self.assertTrue((text or "").endswith("…"))
+        rejected = comments.comment_body(
+            {"verdict": "rejected", "reasons": ["y" * 70_000]}, "https://run"
+        )
+        self.assertIn("https://run", rejected or "")
+
+    def test_reasons_render_on_one_line(self) -> None:
+        """A multiline reason cannot add blocks or mentions to the comment."""
+        text = comments.comment_body(
+            {"verdict": "abstain", "reasons": ["no\n\n# Owned\n@alice"]},
+            "https://run",
+        )
+        self.assertNotIn("\n", text or "")
+        self.assertNotIn("@alice", text or "")
+
+    def test_publish_failed_names_the_run(self) -> None:
+        """A publish failure tells the reader the issue stays eligible."""
+        text = comments.comment_body(
+            {"verdict": "publish-failed", "reasons": ["boom; branch removed"]},
+            "https://run",
+        )
+        self.assertIsNotNone(text)
+        self.assertIn("stays eligible", text or "")
+        self.assertIn("https://run", text or "")
 
 
 class RunApplyTest(NoNetworkCase):
@@ -269,17 +303,103 @@ class RunApplyTest(NoNetworkCase):
         self.assertEqual(result["pull_request_url"], "https://x/pull/1")
         self.assertEqual(result["warnings"], ["could not label the pull request: x"])
 
+    def test_replay_failure_rolls_back_the_branch(self) -> None:
+        """A failure after branch creation deletes the branch and fails the step.
+
+        Without the rollback the half-built branch would count as a prior
+        attempt and keep the issue out of every later run.
+        """
+        path = self.write_check(check_json())
+        with (
+            patch.object(publish, "create_branch"),
+            patch.object(
+                publish,
+                "replay_commits",
+                side_effect=policy.PublishError("createCommitOnBranch failed"),
+            ),
+            patch.object(publish, "open_pull_request") as pull,
+            patch.object(publish, "delete_branch", return_value=None) as delete,
+            self.assertRaisesRegex(policy.PublishError, "branch removed"),
+        ):
+            publish.run_apply(self.apply_args(path))
+        pull.assert_not_called()
+        delete.assert_called_once_with("owner/repo", "code-monkey/issue-7")
+        written = json.loads((self.root / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["verdict"], "publish-failed")
+        self.assertIn("createCommitOnBranch failed", written["reasons"][0])
+        self.assertIsNone(written["pull_request_url"])
+        self.assertIsNone(written["branch_url"])
+
+    def test_pr_failure_reports_leftover_branch(self) -> None:
+        """When rollback itself fails, the leftover is named in the reason."""
+        path = self.write_check(check_json())
+        with (
+            patch.object(publish, "create_branch"),
+            patch.object(publish, "replay_commits", return_value=["f" * 40]),
+            patch.object(
+                publish,
+                "open_pull_request",
+                side_effect=github.GitHubError("boom (HTTP 502)"),
+            ),
+            patch.object(publish, "delete_branch", return_value="branch x stays"),
+            self.assertRaisesRegex(policy.PublishError, "branch x stays"),
+        ):
+            publish.run_apply(self.apply_args(path))
+
+    def test_rerun_after_success_reports_the_existing_pull_request(self) -> None:
+        """A retry meeting its own open PR is published, not rejected, and silent."""
+        path = self.write_check(check_json())
+        with (
+            patch.object(
+                publish, "create_branch", side_effect=policy.Rejection("branch exists")
+            ),
+            patch.object(
+                publish, "existing_pull_request", return_value="https://x/pull/5"
+            ),
+            patch.object(publish, "replay_commits") as replay,
+            patch.object(publish, "delete_branch") as delete,
+        ):
+            result = publish.run_apply(self.apply_args(path))
+        replay.assert_not_called()
+        delete.assert_not_called()
+        self.assertEqual(result["verdict"], "proposed")
+        self.assertEqual(result["pull_request_url"], "https://x/pull/5")
+        self.assertTrue(result["already_published"])
+        self.assertIsNone(comments.comment_body(result, "https://run"))
+
+    def test_branch_create_failure_is_rolled_back(self) -> None:
+        """A create whose reply is lost is treated like any later failure."""
+        path = self.write_check(check_json())
+        with (
+            patch.object(
+                publish,
+                "create_branch",
+                side_effect=policy.PublishError("gh: Bad Gateway (HTTP 502)"),
+            ),
+            patch.object(publish, "replay_commits") as replay,
+            patch.object(publish, "delete_branch", return_value=None) as delete,
+            self.assertRaisesRegex(policy.PublishError, "branch removed"),
+        ):
+            publish.run_apply(self.apply_args(path))
+        replay.assert_not_called()
+        delete.assert_called_once_with("owner/repo", "code-monkey/issue-7")
+        written = json.loads((self.root / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["verdict"], "publish-failed")
+
     def test_existing_branch_becomes_rejection(self) -> None:
-        """A Rejection from create_branch flips the verdict without replaying."""
+        """An existing branch is a rejection and is never deleted by rollback."""
         path = self.write_check(check_json())
         with (
             patch.object(
                 publish, "create_branch", side_effect=policy.Rejection("branch exists")
             ),
             patch.object(publish, "replay_commits") as replay,
+            patch.object(publish, "delete_branch") as delete,
+            patch.object(publish, "existing_pull_request", return_value=None),
         ):
             result = publish.run_apply(self.apply_args(path))
         replay.assert_not_called()
+        delete.assert_not_called()
         self.assertEqual(result["verdict"], "rejected")
         self.assertEqual(result["reasons"], ["branch exists"])
         self.assertIsNone(result["branch_url"])
@@ -324,6 +444,69 @@ class CreateBranchTest(NoNetworkCase):
                 self.assertRaises(policy.PublishError),
             ):
                 publish.create_branch(REPOSITORY, BRANCH, BASE)
+
+
+class DeleteBranchTest(NoNetworkCase):
+    """``delete_branch`` is best effort and reports rather than raises."""
+
+    def test_deletes_via_git_refs(self) -> None:
+        """The ref endpoint receives a DELETE for the branch."""
+        with patch.object(github, "run_gh", return_value="") as run:
+            self.assertIsNone(publish.delete_branch("o/r", "code-monkey/issue-1"))
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "api",
+                "--method",
+                "DELETE",
+                "repos/o/r/git/refs/heads/code-monkey/issue-1",
+            ],
+        )
+
+    def test_absent_branch_is_a_clean_rollback(self) -> None:
+        """Nothing to delete after an ambiguous create is not a leftover."""
+        for message in (
+            "gh: Not Found (HTTP 404)",
+            "gh: Reference does not exist (HTTP 422)",
+        ):
+            with (
+                self.subTest(message=message),
+                patch.object(github, "run_gh", side_effect=github.GitHubError(message)),
+            ):
+                self.assertIsNone(publish.delete_branch("o/r", "b"))
+
+    def test_failure_becomes_a_note(self) -> None:
+        """A failed delete returns text for the result instead of raising."""
+        with patch.object(
+            github, "run_gh", side_effect=github.GitHubError("nope (HTTP 403)")
+        ):
+            note = publish.delete_branch("o/r", "b")
+        self.assertIsNotNone(note)
+        self.assertIn("could not be removed", note or "")
+
+
+class ExistingPullRequestTest(NoNetworkCase):
+    """``existing_pull_request`` finds this repository's own open PR only."""
+
+    def test_same_repository_pr_found(self) -> None:
+        """A same-repository PR from the branch is returned; forks are ignored."""
+        reply = json.dumps(
+            [
+                {"url": "https://fork/pull/1", "isCrossRepository": True},
+                {"url": "https://x/pull/2", "isCrossRepository": False},
+            ]
+        )
+        with patch.object(github, "run_gh", return_value=reply) as run:
+            url = publish.existing_pull_request("o/r", "code-monkey/issue-2")
+        self.assertEqual(url, "https://x/pull/2")
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--state") + 1], "open")
+
+    def test_none_when_only_forks(self) -> None:
+        """Only fork PRs means no earlier attempt of ours."""
+        reply = json.dumps([{"url": "https://fork/pull/1", "isCrossRepository": True}])
+        with patch.object(github, "run_gh", return_value=reply):
+            self.assertIsNone(publish.existing_pull_request("o/r", "b"))
 
 
 class ReplayCommitsTest(NoNetworkCase):
@@ -494,7 +677,7 @@ class RunCommentTest(NoNetworkCase):
             ) as write,
             redirect_stdout(io.StringIO()),
         ):
-            publish.run_comment(argparse.Namespace(result=path, run_url="https://run"))
+            comments.run_comment(argparse.Namespace(result=path, run_url="https://run"))
         self.assertEqual(
             write.call_args.args[1], f"repos/{REPOSITORY}/issues/7/comments"
         )
@@ -511,8 +694,29 @@ class RunCommentTest(NoNetworkCase):
                 patch.object(github, "api_write") as write,
                 redirect_stdout(io.StringIO()),
             ):
-                publish.run_comment(argparse.Namespace(result=path, run_url=""))
+                comments.run_comment(argparse.Namespace(result=path, run_url=""))
             write.assert_not_called()
+
+
+class ReportRowTest(unittest.TestCase):
+    """``report_row`` renders one escaped table cell whatever the source."""
+
+    def test_title_fallback_is_escaped_and_flattened(self) -> None:
+        """A title with a pipe and a newline stays inside its cell."""
+        row = reporting.report_row(
+            {
+                "repository": "o/r",
+                "issue": 1,
+                "verdict": "proposed",
+                "reasons": [],
+                "pr_title": "Feat: A | B\n::error::x",
+                "pull_request_url": "https://x/pull/1",
+            }
+        )
+        self.assertEqual(row.count("\n"), 0)
+        self.assertIn("A \\| B", row)
+        self.assertNotIn("::error::", row)
+        self.assertEqual(row.count("|") - row.count("\\|"), 6)
 
 
 class RunReportTest(NoNetworkCase):
@@ -546,7 +750,7 @@ class RunReportTest(NoNetworkCase):
         (results / "ignored.json").write_text("[]", encoding="utf-8")
         output_md = self.root / "out" / "report.md"
         output_json = self.root / "out" / "report.json"
-        publish.run_report(
+        reporting.run_report(
             argparse.Namespace(
                 results=results, output_md=output_md, output_json=output_json
             )
@@ -560,13 +764,20 @@ class RunReportTest(NoNetworkCase):
         self.assertIn(f"| {REPOSITORY}#2 | rejected | — | 3 | a \\| b; w |", markdown)
         self.assertEqual(markdown.count("| unreadable |"), 1)
         self.assertIn(
-            "Proposed 1, abstained 0, rejected 1, failed 0; premium requests 7.",
+            "Proposed 1, abstained 0, rejected 1, failed 0, publish failures 0; "
+            "premium requests 7.",
             markdown,
         )
         report = json.loads(output_json.read_text(encoding="utf-8"))
         self.assertEqual(
             report["totals"],
-            {"proposed": 1, "abstain": 0, "rejected": 1, "author-failed": 0},
+            {
+                "proposed": 1,
+                "abstain": 0,
+                "rejected": 1,
+                "author-failed": 0,
+                "publish-failed": 0,
+            },
         )
         self.assertEqual(report["premium_requests"], 7)
         self.assertEqual(len(report["unreadable"]), 1)
@@ -578,7 +789,7 @@ class RunReportTest(NoNetworkCase):
         results.mkdir()
         output_md = self.root / "report.md"
         output_json = self.root / "report.json"
-        publish.run_report(
+        reporting.run_report(
             argparse.Namespace(
                 results=results, output_md=output_md, output_json=output_json
             )
@@ -587,7 +798,7 @@ class RunReportTest(NoNetworkCase):
 
     def test_dry_run_row(self) -> None:
         """A dry-run proposed result shows ``dry run`` instead of a URL."""
-        row = publish.report_row(result_json(dry_run=True))
+        row = reporting.report_row(result_json(dry_run=True))
         self.assertIn("| proposed | dry run |", row)
 
 

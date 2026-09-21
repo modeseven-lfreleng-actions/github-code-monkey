@@ -330,6 +330,63 @@ class RunCheckProposedTest(GitCase):
         self.assertEqual(check.verdict, "proposed", check.reasons)
         self.assertTrue(check.needs_workflows)
 
+    def test_non_utf8_path_rejected(self) -> None:
+        """A path that is not valid UTF-8 cannot be replayed faithfully.
+
+        Built through git plumbing: APFS refuses such names on disk, and
+        a hostile bundle would carry the bytes without a checkout anyway.
+        """
+        agent = self.fixture.agent
+        blob = (
+            subprocess.run(
+                ["git", "-C", str(agent), "hash-object", "-w", "--stdin"],
+                input=b"x\n",
+                capture_output=True,
+                check=True,
+                timeout=60,
+            )
+            .stdout.decode()
+            .strip()
+        )
+        # Add the bad name to the current index so the rest of the tree,
+        # protected files included, stays as it was.
+        subprocess.run(
+            ["git", "-C", str(agent), "update-index", "--add", "--index-info"],
+            input=b"100644 " + blob.encode() + b"\tdocs/note\xe9.md\n",
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+        tree = run_git(agent, "write-tree").strip()
+        commit = run_git(
+            agent, "commit-tree", tree, "-p", "HEAD", "-m", "Docs: Add note\n\nBody.\n"
+        ).strip()
+        run_git(agent, "update-ref", f"refs/heads/{self.fixture.branch}", commit)
+        self.fixture.bundle()
+        self.fixture.manifest(pr_title="Docs: Add note")
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "rejected")
+        self.assertTrue(
+            any("not valid UTF-8" in r for r in check.reasons), check.reasons
+        )
+
+    def test_workflow_deletion_flags_permission(self) -> None:
+        """Deleting a workflow file needs the grant as much as writing one."""
+        self.fixture.commit(
+            "CI: Add a workflow\n\nBody.\n",
+            {".github/workflows/old.yaml": "on: push\njobs: {}\n"},
+        )
+        self.fixture.commit(
+            "CI: Remove the workflow\n\nBody.\n",
+            {".github/workflows/old.yaml": None},
+        )
+        self.fixture.bundle()
+        self.fixture.manifest(pr_title="Two commits")
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "proposed", check.reasons)
+        self.assertTrue(check.needs_workflows)
+        self.assertEqual(check.commits[1]["deletions"], [".github/workflows/old.yaml"])
+
     def test_multiple_commits_and_deletion(self) -> None:
         """Two commits keep their order; deletions are recorded; title is free."""
         first = self.fixture.commit(
@@ -393,10 +450,18 @@ class RunCheckOutcomeTest(GitCase):
         self.assertEqual(check.verdict, "rejected")
         self.assertIn("not recognised", check.reasons[0])
 
-    def test_missing_manifest_is_operational(self) -> None:
-        """No manifest at all is a PublishError, not a verdict."""
-        with self.assertRaises(policy.PublishError):
-            self.fixture.run()
+    def test_missing_or_malformed_manifest_is_a_rejection(self) -> None:
+        """Manifest problems are agent output, so they become a typed verdict."""
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "rejected")
+        self.assertIn("manifest", check.reasons[0])
+        for content in ("not json", "[1, 2]", '"a string"'):
+            with self.subTest(content=content):
+                (self.fixture.proposal / "manifest.json").write_text(
+                    content, encoding="utf-8"
+                )
+                check = self.fixture.run()
+                self.assertEqual(check.verdict, "rejected")
 
     def test_missing_bundle_rejected(self) -> None:
         """A proposed outcome without a bundle is rejected."""
@@ -404,6 +469,17 @@ class RunCheckOutcomeTest(GitCase):
         check = self.fixture.run()
         self.assertEqual(check.verdict, "rejected")
         self.assertIn("lacks changes.bundle", check.reasons[0])
+
+
+class ReasonBoundTest(GitCase):
+    """Reasons from the untrusted manifest are cut to a bounded size."""
+
+    def test_abstain_reason_truncated(self) -> None:
+        """A 70,000-character reason is recorded at MAX_REASON characters."""
+        self.fixture.manifest(outcome="abstain", reason="z" * 70_000)
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "abstain")
+        self.assertEqual(len(check.reasons[0]), policy.MAX_REASON)
 
 
 class RunCheckRejectionTest(GitCase):
@@ -502,6 +578,29 @@ class RunCheckRejectionTest(GitCase):
         self.assertIn("repository", reasons)
         self.assertIn("issue", reasons)
 
+    def test_empty_commit_rejected(self) -> None:
+        """A commit with no file changes cannot go through the API."""
+        self.fixture.commit("Chore: Nothing\n\nBody.\n")
+        self.fixture.bundle()
+        self.fixture.manifest(pr_title="Chore: Nothing")
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "rejected")
+        self.assertTrue(
+            any("changes no files" in r for r in check.reasons), check.reasons
+        )
+
+    def test_too_many_files_in_one_commit_rejected(self) -> None:
+        """The API replays at most 100 file changes per commit."""
+        files: dict[str, str | None] = {
+            f"many/f{i:03d}.txt": f"{i}\n" for i in range(101)
+        }
+        self.fixture.commit("Feat: Add many files\n\nBody.\n", files)
+        self.fixture.bundle()
+        self.fixture.manifest(pr_title="Feat: Add many files")
+        check = self.fixture.run()
+        self.assertEqual(check.verdict, "rejected")
+        self.assertTrue(any("101 files" in r for r in check.reasons), check.reasons)
+
     def test_too_many_commits(self) -> None:
         """Six commits exceed the limit of five."""
         for index in range(6):
@@ -576,6 +675,52 @@ class RunCheckRejectionTest(GitCase):
         run_git(agent, "bundle", "create", "-q", str(target), f"{moved}..{BRANCH}")
         self.fixture.manifest()
         self.assertIn("bundle failed verification", self.rejected())
+
+
+class UsageNumberTest(unittest.TestCase):
+    """``usage_number`` accepts finite non-negative reals and nothing else."""
+
+    def test_accepts_plain_numbers(self) -> None:
+        """Ints and floats pass through as floats."""
+        self.assertEqual(model.usage_number(12), 12.0)
+        self.assertEqual(model.usage_number(0.5), 0.5)
+        self.assertEqual(model.usage_number(0), 0.0)
+
+    def test_rejects_hostile_values(self) -> None:
+        """Booleans, negatives, infinities, NaN, strings and absurd sizes are None."""
+        for value in (
+            True,
+            False,
+            -1,
+            float("inf"),
+            float("nan"),
+            "7",
+            None,
+            1e13,
+            10**1000,
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(model.usage_number(value))
+
+    def test_read_usage_survives_hostile_file(self) -> None:
+        """A usage.json full of junk leaves the spend fields unset, not an error."""
+        with tempfile.TemporaryDirectory() as holder:
+            path = Path(holder) / "usage.json"
+            path.write_text(
+                '{"totalPremiumRequestCost": 1e309, "totalApiDurationMs": true}',
+                encoding="utf-8",
+            )
+            check = model.Check(
+                key="k",
+                repository="o/r",
+                issue=1,
+                branch="b",
+                base_sha="a" * 40,
+                default_branch="main",
+            )
+            model.read_usage(path, check)
+        self.assertIsNone(check.premium_requests)
+        self.assertIsNone(check.agent_seconds)
 
 
 class CheckSummaryTest(unittest.TestCase):

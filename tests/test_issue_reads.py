@@ -180,9 +180,18 @@ class PriorAttemptTest(ReadsCase):
     """``prior_attempt`` consults pull requests first, then the branch."""
 
     def test_pull_request_exists(self) -> None:
-        """A non-empty PR list is enough; the branch is not read."""
+        """A same-repository PR from the branch is enough; the branch is not read."""
+        same = json.dumps(
+            [
+                {
+                    "number": 3,
+                    "isCrossRepository": False,
+                    "headRepository": {"nameWithOwner": "org/repo"},
+                }
+            ]
+        )
         with (
-            patch.object(github, "run_gh", return_value='[{"number": 3}]') as gh,
+            patch.object(github, "run_gh", return_value=same) as gh,
             patch.object(github, "api_object") as read,
         ):
             self.assertTrue(reads.prior_attempt("org/repo", "code-monkey/issue-3"))
@@ -192,6 +201,47 @@ class PriorAttemptTest(ReadsCase):
         self.assertIn("--head", args)
         self.assertEqual(args[args.index("--head") + 1], "code-monkey/issue-3")
         self.assertEqual(args[args.index("--state") + 1], "all")
+        self.assertIn("headRepository", args[args.index("--json") + 1])
+
+    def test_fork_pull_request_does_not_count(self) -> None:
+        """A PR from a fork branch of the same name is not a bot attempt."""
+        fork = json.dumps(
+            [
+                {
+                    "number": 9,
+                    "isCrossRepository": True,
+                    "headRepository": {"nameWithOwner": "someone/repo"},
+                }
+            ]
+        )
+        with (
+            patch.object(github, "run_gh", return_value=fork),
+            patch.object(
+                github,
+                "api_object",
+                side_effect=github.GitHubError("gh: Not Found (HTTP 404)"),
+            ) as read,
+        ):
+            self.assertFalse(reads.prior_attempt("org/repo", "code-monkey/issue-9"))
+        read.assert_called_once()
+
+    def test_head_repository_name_match_is_case_insensitive(self) -> None:
+        """A cross-repository flag alone does not decide; the head name may match."""
+        odd = json.dumps(
+            [
+                {
+                    "number": 4,
+                    "isCrossRepository": True,
+                    "headRepository": {"nameWithOwner": "Org/Repo"},
+                }
+            ]
+        )
+        with (
+            patch.object(github, "run_gh", return_value=odd),
+            patch.object(github, "api_object") as read,
+        ):
+            self.assertTrue(reads.prior_attempt("org/repo", "code-monkey/issue-4"))
+        read.assert_not_called()
 
     def test_no_pull_request_no_branch(self) -> None:
         """An empty list and a 404 on the branch means no prior attempt."""
@@ -462,6 +512,24 @@ class BranchHeadTest(ReadsCase):
             read.call_args_list[2].args[0], f"repos/org/repo/git/tags/{tag_sha}"
         )
 
+    def test_tag_to_non_commit_rejected(self) -> None:
+        """An annotated tag pointing at a tree is not a commit."""
+        tag_ref: dict[str, Any] = {"object": {"type": "tag", "sha": "b" * 40}}
+        tag_obj: dict[str, Any] = {"object": {"type": "tree", "sha": "c" * 40}}
+        with (
+            patch.object(
+                github,
+                "api_object",
+                side_effect=[
+                    github.GitHubError("gh: Not Found (HTTP 404)"),
+                    tag_ref,
+                    tag_obj,
+                ],
+            ),
+            self.assertRaisesRegex(github.GitHubError, "does not resolve to a commit"),
+        ):
+            reads.branch_head("org/repo", "v1.0.0")
+
     def test_unknown_ref_raises(self) -> None:
         """Neither branch nor tag: a clear error naming the ref."""
         missing = github.GitHubError("gh: Not Found (HTTP 404)")
@@ -518,6 +586,21 @@ class FetchGuidanceTest(ReadsCase):
         ):
             reads.fetch_guidance("org/.github", "main", "AGENTS.md")
 
+    def test_oversized_guidance_raises(self) -> None:
+        """Guidance past the verifier's cap fails in select, not in every job."""
+        big = b"x" * (reads.MAX_GUIDANCE_BYTES + 1)
+        content = {"encoding": "base64", "content": base64.b64encode(big).decode()}
+        with (
+            patch.object(github, "api_object", side_effect=[REF_COMMIT, content]),
+            self.assertRaisesRegex(github.GitHubError, "limit"),
+        ):
+            reads.fetch_guidance("org/.github", "main", "AGENTS.md")
+
+    def test_guidance_cap_matches_the_verifier(self) -> None:
+        """The select-side cap and the evidence verifier's cap agree."""
+        evidence = import_module("monkey_evidence")
+        self.assertEqual(reads.MAX_GUIDANCE_BYTES, evidence.MAX_GUIDANCE_BYTES)
+
     def test_non_base64_encoding_raises(self) -> None:
         """Any encoding other than base64 is refused."""
         content = {"encoding": "utf-8", "content": "plain"}
@@ -543,6 +626,21 @@ class FetchGuidanceTest(ReadsCase):
             self.assertRaises(github.GitHubError),
         ):
             reads.fetch_guidance("org/.github", "main", "AGENTS.md")
+
+
+class TruncateUtf8Test(unittest.TestCase):
+    """``truncate_utf8`` bounds by encoded bytes without splitting a character."""
+
+    def test_bytes_not_characters(self) -> None:
+        """Four-byte characters count four each."""
+        text = "😀" * 10
+        result = reads.truncate_utf8(text, 10)
+        self.assertEqual(result, "😀😀")
+        self.assertLessEqual(len(result.encode("utf-8")), 10)
+
+    def test_short_text_untouched(self) -> None:
+        """Text within the limit is returned as is."""
+        self.assertEqual(reads.truncate_utf8("abc", 3), "abc")
 
 
 class LabelNamesTest(unittest.TestCase):
@@ -576,9 +674,23 @@ class ListRepositoriesTest(ReadsCase):
                     "isArchived": True,
                     "isTemplate": False,
                     "isFork": False,
+                    "isPrivate": False,
+                    "visibility": "PUBLIC",
                     "defaultBranchRef": {"name": "develop"},
                 },
                 {"name": "beta", "defaultBranchRef": None},
+                {
+                    "name": "secret",
+                    "isPrivate": True,
+                    "visibility": "PRIVATE",
+                    "defaultBranchRef": {"name": "main"},
+                },
+                {
+                    "name": "inner",
+                    "isPrivate": False,
+                    "visibility": "INTERNAL",
+                    "defaultBranchRef": {"name": "main"},
+                },
             ]
         )
         with patch.object(github, "run_gh", return_value=payload):
@@ -591,6 +703,7 @@ class ListRepositoriesTest(ReadsCase):
                     "archived": True,
                     "template": False,
                     "fork": False,
+                    "public": True,
                     "default_branch": "develop",
                 },
                 "beta": {
@@ -598,7 +711,24 @@ class ListRepositoriesTest(ReadsCase):
                     "archived": False,
                     "template": False,
                     "fork": False,
+                    "public": False,
                     "default_branch": None,
+                },
+                "secret": {
+                    "name": "secret",
+                    "archived": False,
+                    "template": False,
+                    "fork": False,
+                    "public": False,
+                    "default_branch": "main",
+                },
+                "inner": {
+                    "name": "inner",
+                    "archived": False,
+                    "template": False,
+                    "fork": False,
+                    "public": False,
+                    "default_branch": "main",
                 },
             },
         )
@@ -611,6 +741,69 @@ class ListRepositoriesTest(ReadsCase):
             self.assertRaises(reads.SelectionError),
         ):
             reads.list_repositories("org")
+
+
+class RunGhRetryTest(unittest.TestCase):
+    """``run_gh`` retries transient failures on reads and never on writes."""
+
+    def setUp(self) -> None:
+        """Make the backoff instant."""
+        sleep = patch.object(github.time, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def test_read_retries_a_502_then_succeeds(self) -> None:
+        """Two 502s then success returns the successful output."""
+        with patch.object(
+            github,
+            "run_once",
+            side_effect=[
+                github.GitHubError("gh: Server Error (HTTP 502)"),
+                github.GitHubError("gh: Server Error (HTTP 502)"),
+                "ok",
+            ],
+        ) as once:
+            self.assertEqual(github.run_gh(["api", "repos/o/r/issues/1"]), "ok")
+        self.assertEqual(once.call_count, 3)
+
+    def test_read_gives_up_after_the_budget(self) -> None:
+        """Persistent 5xx still fails, after the bounded attempts."""
+        error = github.GitHubError("gh: Server Error (HTTP 503)")
+        with (
+            patch.object(github, "run_once", side_effect=[error] * 3) as once,
+            self.assertRaises(github.GitHubError),
+        ):
+            github.run_gh(["search", "issues", "--owner", "o"])
+        self.assertEqual(once.call_count, github.READ_ATTEMPTS)
+
+    def test_client_errors_are_not_retried(self) -> None:
+        """A 404 is an answer, not a blip."""
+        with (
+            patch.object(
+                github,
+                "run_once",
+                side_effect=github.GitHubError("gh: Not Found (HTTP 404)"),
+            ) as once,
+            self.assertRaises(github.GitHubError),
+        ):
+            github.run_gh(["api", "repos/o/r"])
+        self.assertEqual(once.call_count, 1)
+
+    def test_writes_and_graphql_run_once(self) -> None:
+        """A POST, a DELETE or any GraphQL call is never repeated."""
+        error = github.GitHubError("gh: Server Error (HTTP 502)")
+        for args in (
+            ["api", "--method", "POST", "repos/o/r/pulls", "--input", "-"],
+            ["api", "--method", "DELETE", "repos/o/r/git/refs/heads/b"],
+            ["api", "graphql", "--input", "-"],
+        ):
+            with (
+                self.subTest(args=args),
+                patch.object(github, "run_once", side_effect=error) as once,
+                self.assertRaises(github.GitHubError),
+            ):
+                github.run_gh(args)
+            self.assertEqual(once.call_count, 1)
 
 
 class GitHubErrorTest(unittest.TestCase):

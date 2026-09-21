@@ -80,7 +80,7 @@ on:
       egress_policy:
         description: 'harden-runner egress for trusted jobs: audit or block'
         type: string
-        default: 'audit'
+        default: 'block'
       egress_allow_config:
         description: 'harden-runner-block-action config coordinate'
         type: string
@@ -180,6 +180,9 @@ jobs:
           MAX_AGENTS: "${{ inputs.max_concurrent_agents }}"
           MODEL: "${{ inputs.model }}"
           REPOSITORIES: "${{ inputs.repositories }}"
+          ORG: "${{ inputs.org }}"
+          # yamllint disable-line rule:line-length
+          GUIDANCE_REPOSITORY: "${{ inputs.guidance_repository || format('{0}/.github', inputs.org) }}"
         run: |
           case "$MODE" in
             select|branches|pull-requests) ;;
@@ -199,8 +202,20 @@ jobs:
           # repository list is normalised to commas for the App token
           # action, which does not split on spaces; empty keeps the
           # read token organisation-wide, which the scan needs.
+          # sed rather than grep -v: grep exits 1 on empty input, which
+          # would fail this assignment under pipefail.
           repositories="$(printf '%s' "$REPOSITORIES" | tr ', ' '\n' \
-            | grep -v '^$' | paste -sd, -)"
+            | sed '/^$/d' | paste -sd, -)"
+          # A scoped token must still reach the guidance repository
+          # when it lives in the same organisation.
+          guidance_owner="${GUIDANCE_REPOSITORY%%/*}"
+          guidance_name="${GUIDANCE_REPOSITORY#*/}"
+          if [ -n "$repositories" ] && [ "$guidance_owner" = "$ORG" ]; then
+            case ",$repositories," in
+              *",$guidance_name,"*) ;;
+              *) repositories="$repositories,$guidance_name" ;;
+            esac
+          fi
           {
             echo "agent_timeout=$MAX_RUNTIME"
             echo "author_timeout=$((MAX_RUNTIME + 20))"
@@ -560,7 +575,15 @@ jobs:
                          + " and left no manifest")
               }' > artefacts/manifest.json
           fi
-          outcome="$(jq -r '.outcome' artefacts/manifest.json)"
+          # The manifest is agent output; print a known value or a
+          # marker, never its raw text, from a job that writes logs
+          # workflow commands are parsed from.
+          case "$(jq -r '.outcome // ""' artefacts/manifest.json)" in
+            proposed) outcome=proposed ;;
+            abstain) outcome=abstain ;;
+            author-failed) outcome=author-failed ;;
+            *) outcome=unrecognised ;;
+          esac
           if [ "$outcome" = proposed ]; then
             ref="refs/heads/$BRANCH"
             if git -C workspace rev-parse --verify -q "$ref" > /dev/null; then
@@ -718,17 +741,25 @@ jobs:
           BRANCH: "${{ matrix.branch }}"
         run: |
           # shellcheck disable=SC2016  # jq variables, not shell expansions
-          mkdir -p accepted
-          if [ "$FETCHED" = success ]; then
-            python3 monkey-assets/scripts/monkey_evidence.py accept \
-              --directory untrusted-proposal --output accepted
-          else
+          # A missing or unacceptable artifact (oversized, symlinked,
+          # malformed) still yields a typed manifest, so the check,
+          # result, comment and report rows all happen for this issue.
+          reason=''
+          if [ "$FETCHED" != success ]; then
+            reason='the author job produced no proposal artifact'
+          elif ! python3 monkey-assets/scripts/monkey_evidence.py accept \
+              --directory untrusted-proposal --output accepted; then
+            reason='the proposal artifact failed bounded acceptance'
+          fi
+          if [ -n "$reason" ]; then
+            rm -rf accepted
+            mkdir -p accepted
             jq -n --arg repo "$REPOSITORY" --argjson issue "$ISSUE" \
-              --arg base "$BASE_SHA" --arg branch "$BRANCH" '{
+              --arg base "$BASE_SHA" --arg branch "$BRANCH" \
+              --arg reason "$reason" '{
                 schema: 1, outcome: "author-failed",
                 repository: $repo, issue: $issue, base_sha: $base,
-                branch: $branch,
-                reason: "the author job produced no proposal artifact"
+                branch: $branch, reason: $reason
               }' > accepted/manifest.json
           fi
 
@@ -764,7 +795,9 @@ jobs:
           client-id: "${{ inputs.github_app_client_id }}"
           private-key: "${{ secrets.github_app_private_key }}"
           owner: "${{ inputs.org }}"
-          repositories: "${{ matrix.repository }}"
+          # The bare name, relative to owner: independent of how the
+          # action parses an owner/repository form.
+          repositories: "${{ matrix.repo_name }}"
           permission-contents: 'write'
           permission-metadata: 'read'
           # yamllint disable-line rule:line-length
@@ -785,21 +818,27 @@ jobs:
             --check artefacts/check.json --workdir work \
             --mode "$MODE" --output artefacts/result.json "${extra[@]}"
 
+      # Runs after a failed apply as well, so a publish failure and
+      # its rollback reach the issue; never after cancellation.
       - name: 'Mint issue comment token'
         id: comment-token
-        if: ${{ !inputs.dry_run && inputs.github_app_client_id != '' }}
+        # yamllint disable-line rule:line-length
+        if: ${{ !cancelled() && steps.apply.outcome != 'skipped' && !inputs.dry_run && inputs.github_app_client_id != '' }}
         # yamllint disable-line rule:line-length
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: "${{ inputs.github_app_client_id }}"
           private-key: "${{ secrets.github_app_private_key }}"
           owner: "${{ inputs.org }}"
-          repositories: "${{ matrix.repository }}"
+          # The bare name, relative to owner: independent of how the
+          # action parses an owner/repository form.
+          repositories: "${{ matrix.repo_name }}"
           permission-issues: 'write'
           permission-metadata: 'read'
 
       - name: 'Comment on the issue'
-        if: ${{ !inputs.dry_run && inputs.github_app_client_id != '' }}
+        # yamllint disable-line rule:line-length
+        if: ${{ !cancelled() && steps.apply.outcome != 'skipped' && !inputs.dry_run && inputs.github_app_client_id != '' }}
         env:
           GH_TOKEN: "${{ steps.comment-token.outputs.token }}"
           # yamllint disable-line rule:line-length
@@ -832,6 +871,14 @@ jobs:
       actions: read  # Gather per-issue result artifacts
       contents: read  # Checkout the report script
     steps:
+      - name: 'Load egress allow-list'
+        if: inputs.egress_policy == 'block'
+        # yamllint disable-line rule:line-length
+        uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: "${{ inputs.egress_allow_config }}"
+          allow_list_summary: 'false'
+
       - name: 'Harden runner'
         # yamllint disable-line rule:line-length
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
