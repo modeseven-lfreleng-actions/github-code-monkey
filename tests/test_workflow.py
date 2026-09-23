@@ -767,6 +767,18 @@ class TestingCallerContracts(WorkflowCase):
             with_["assets_ref"], "github.event.pull_request.head.sha"
         )
 
+    def test_callers_read_guidance_from_the_organisation_default(self) -> None:
+        """Test runs use the reusable default, <org>/.github at main.
+
+        The organisation AGENTS.md has merged; a pinned fork branch here
+        would test against guidance production never reads.
+        """
+        for name in ("plumbing", "dry-run"):
+            with self.subTest(job=name):
+                with_ = cast(dict[str, Any], self.jobs[name]["with"])
+                self.assertNotIn("guidance_repository", with_)
+                self.assertNotIn("guidance_ref", with_)
+
     def test_regression_runs_the_locked_unittest_suite(self) -> None:
         """The offline suite runs under the locked environment, verbosely."""
         step = self.step("regression", "Run offline regression suite")

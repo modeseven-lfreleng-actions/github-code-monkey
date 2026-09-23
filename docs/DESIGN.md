@@ -749,10 +749,10 @@ switch.
   within the ten-round cap the org guidance sets.
 - **More than one issue per repository per run**, sequentially in
   one session, if the one-per-repository rule starves the backlog.
-- **Stub roll-out.** Once `lfreleng-actions/.github` PR 206 merges,
-  a one-off mode could open the `AGENTS.md` stub pull request in
-  every repository, which is itself an issue this workflow could
-  work.
+- **Stub roll-out.** The organisation `AGENTS.md` is on `main` of
+  `lfreleng-actions/.github`; a one-off mode could open its §12 stub
+  pull request in every repository, which is itself an issue this
+  workflow could work.
 - **Dispatch from triage** in place of the two-hour cron offset
   (§11), once a cross-repository token has an owner.
 - **Private repositories.** A `contents: read` token for the author

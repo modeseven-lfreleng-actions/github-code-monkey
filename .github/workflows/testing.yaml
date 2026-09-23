@@ -48,12 +48,6 @@ jobs:
       # caller runs, so a pull request proves the trusted jobs' egress.
       egress_policy: 'block'
       egress_allow_config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
-      # The organisation guidance exists on the fork branch behind
-      # lfreleng-actions/.github PR 206 until it merges. Switch both
-      # values to "${{ github.repository_owner }}/.github" and 'main'
-      # at that point; the reusable workflow defaults to those.
-      guidance_repository: 'modeseven-lfreleng-actions/.github'
-      guidance_ref: 'docs/org-wide-agents-guidance'
       assets_repository: >-
         ${{ github.event.pull_request.head.repo.full_name }}
       assets_ref: "${{ github.event.pull_request.head.sha }}"
@@ -79,9 +73,6 @@ jobs:
       repositories: "${{ inputs.repositories || '' }}"
       egress_policy: 'block'
       egress_allow_config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
-      # Same interim source as the plumbing job above.
-      guidance_repository: 'modeseven-lfreleng-actions/.github'
-      guidance_ref: 'docs/org-wide-agents-guidance'
       assets_repository: "${{ github.repository }}"
       assets_ref: "${{ github.sha }}"
     secrets:
